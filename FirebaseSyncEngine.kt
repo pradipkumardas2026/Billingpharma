@@ -5,21 +5,18 @@ import android.util.Log
 import com.example.data.local.dao.PharmaDao
 import com.example.data.local.entity.*
 import com.example.util.NetworkMonitor
+import com.google.android.gms.tasks.Tasks
+import com.google.firebase.firestore.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 enum class SyncState {
     OFFLINE,
@@ -37,7 +34,7 @@ data class SyncInfo(
     val errorMessage: String? = null,
     val deviceId: String = "",
     val deviceName: String = "This Device",
-    val projectId: String = "pharmabill-cloud-sync"
+    val projectId: String = "pharma-billing-cloud"
 )
 
 class FirebaseSyncEngine(
@@ -53,13 +50,59 @@ class FirebaseSyncEngine(
     private val syncScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val syncMutex = Mutex()
 
+    private val listenerRegistrations = mutableListOf<ListenerRegistration>()
+    @Volatile
+    private var lastDetailedError: String? = null
+
+    private val firestore: FirebaseFirestore by lazy {
+        val db = FirebaseFirestore.getInstance()
+        try {
+            val settings = FirebaseFirestoreSettings.Builder()
+                .setPersistenceEnabled(true)
+                .build()
+            db.firestoreSettings = settings
+        } catch (e: Exception) {
+            Log.d("FirebaseSyncEngine", "Firestore settings note: ${e.message}")
+        }
+        db
+    }
+
+    private val collectionsToSync = listOf(
+        "pharma_medicines",
+        "pharma_parties",
+        "pharma_doctors",
+        "pharma_patients",
+        "pharma_invoices",
+        "pharma_settings",
+        "pharma_admin_users",
+        "pharma_guest_logins",
+        "pharma_stock_transactions",
+        "pharma_tombstones"
+    )
+
+    private var currentUserMobile: String = "9002625428"
+    private var currentUserRole: String = "Master Admin"
+
+    fun setCurrentUser(mobile: String, role: String) {
+        currentUserMobile = mobile.trim().ifEmpty { "9002625428" }
+        currentUserRole = role.trim().ifEmpty { "Master Admin" }
+    }
+
+    fun getCurrentUserMobile(): String = currentUserMobile
+    fun getCurrentUserRole(): String = currentUserRole
+
     init {
-        // Observe network changes
+        // Start real-time Firestore listeners for immediate multi-device push/pull
+        setupRealtimeListeners()
+
+        // Observe network state transitions
         syncScope.launch {
             networkMonitor.isOnline.collect { online ->
+                val currentPending = dao.getPendingSyncOperations().size
                 _syncInfo.value = _syncInfo.value.copy(
                     isOnline = online,
-                    state = if (!online) SyncState.OFFLINE else if (_syncInfo.value.pendingCount > 0) SyncState.SYNCING else SyncState.SYNCED
+                    pendingCount = currentPending,
+                    state = if (!online) SyncState.OFFLINE else if (currentPending > 0) SyncState.SYNCING else SyncState.SYNCED
                 )
                 if (online) {
                     triggerAutomaticSync()
@@ -67,10 +110,10 @@ class FirebaseSyncEngine(
             }
         }
 
-        // Periodically poll for changes from other devices when online (every 25 seconds)
+        // Periodic sync trigger when online
         syncScope.launch {
             while (isActive) {
-                delay(25000L)
+                delay(20000L)
                 if (networkMonitor.isOnline.value) {
                     triggerAutomaticSync()
                 }
@@ -85,7 +128,7 @@ class FirebaseSyncEngine(
             prefs.edit().putString("device_id", devId).apply()
         }
         val devName = prefs.getString("device_name", "Device " + devId.takeLast(4)) ?: "This Device"
-        val projId = prefs.getString("firebase_project_id", "pharmabill-cloud-sync") ?: "pharmabill-cloud-sync"
+        val projId = prefs.getString("firebase_project_id", "pharma-billing-cloud") ?: "pharma-billing-cloud"
         val lastSync = prefs.getLong("last_sync_time", 0L)
         val formatted = if (lastSync > 0) formatTimestamp(lastSync) else "Never"
 
@@ -106,7 +149,7 @@ class FirebaseSyncEngine(
     fun setFirebaseProjectId(newProjectId: String) = updateFirebaseProjectId(newProjectId)
 
     fun updateFirebaseProjectId(newProjectId: String) {
-        val trimmed = newProjectId.trim().ifEmpty { "pharmabill-cloud-sync" }
+        val trimmed = newProjectId.trim().ifEmpty { "pharma-billing-cloud" }
         prefs.edit().putString("firebase_project_id", trimmed).apply()
         _syncInfo.value = _syncInfo.value.copy(projectId = trimmed)
         triggerAutomaticSync()
@@ -122,23 +165,91 @@ class FirebaseSyncEngine(
 
     fun cleanup() {
         try {
+            listenerRegistrations.forEach { it.remove() }
+            listenerRegistrations.clear()
             networkMonitor.stopMonitoring()
             syncScope.cancel()
         } catch (_: Exception) {}
     }
 
-    fun triggerAutomaticSync() {
-        if (!networkMonitor.isOnline.value) {
-            _syncInfo.value = _syncInfo.value.copy(state = SyncState.OFFLINE, isOnline = false)
-            return
-        }
+    /**
+     * Attaches Firestore Snapshot Listeners for real-time instantaneous sync across all devices.
+     * When any device inserts/updates/deletes a record, all other devices receive the update immediately.
+     */
+    private fun setupRealtimeListeners() {
+        val currentDeviceId = getDeviceId()
 
+        for (collName in collectionsToSync) {
+            try {
+                val registration = firestore.collection(collName)
+                    .addSnapshotListener { snapshots, error ->
+                        if (error != null) {
+                            Log.w("FirebaseSyncEngine", "Snapshot listener error for $collName: ${error.message}")
+                            return@addSnapshotListener
+                        }
+
+                        if (snapshots != null && !snapshots.isEmpty) {
+                            syncScope.launch {
+                                for (docChange in snapshots.documentChanges) {
+                                    val doc = docChange.document
+                                    val docDeviceId = doc.getString("deviceId") ?: doc.getString("deletedByDevice") ?: ""
+                                    // Multi-device sync: only process changes originated from OTHER devices
+                                    if (docDeviceId != currentDeviceId && docDeviceId.isNotEmpty()) {
+                                        val entityType = doc.getString("entityType") ?: getEntityTypeFromCollection(collName)
+                                        val entityId = doc.getString("entityId") ?: doc.id
+                                        val payloadJson = doc.getString("payloadJson") ?: ""
+                                        val isDeleted = doc.getBoolean("isDeleted") ?: (docChange.type == DocumentChange.Type.REMOVED) || (collName == "pharma_tombstones")
+                                        val remoteTimestamp = doc.getLong("deletedAt") ?: doc.getLong("timestamp") ?: System.currentTimeMillis()
+                                        val userMob = doc.getString("userMobile") ?: doc.getString("deletedByUser") ?: ""
+
+                                        if (isDeleted || collName == "pharma_tombstones") {
+                                            val tomb = TombstoneEntity(
+                                                entityType = entityType,
+                                                entityId = entityId,
+                                                deletedAt = remoteTimestamp,
+                                                deviceId = docDeviceId,
+                                                userMobile = userMob
+                                            )
+                                            dao.insertTombstone(tomb)
+                                            applyDeletionToRoom(entityType, entityId)
+                                            Log.d("FirebaseSyncEngine", "Real-time deletion applied for $entityType $entityId")
+                                        } else if (payloadJson.isNotBlank()) {
+                                            // Check if tombstoned on this device
+                                            if (dao.isTombstoned(entityType, entityId) > 0) {
+                                                applyDeletionToRoom(entityType, entityId)
+                                                Log.d("FirebaseSyncEngine", "Ignored resurrection of tombstoned $entityType $entityId")
+                                            } else {
+                                                applyRemoteChange(entityType, payloadJson, false, remoteTimestamp)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                listenerRegistrations.add(registration)
+            } catch (e: Exception) {
+                Log.e("FirebaseSyncEngine", "Failed to register listener for $collName: ${e.message}")
+            }
+        }
+    }
+
+    fun triggerAutomaticSync() {
         syncScope.launch {
+            if (!networkMonitor.isOnline.value) {
+                val pending = dao.getPendingSyncOperations().size
+                _syncInfo.value = _syncInfo.value.copy(
+                    state = SyncState.OFFLINE,
+                    isOnline = false,
+                    pendingCount = pending
+                )
+                return@launch
+            }
             performFullSync()
         }
     }
 
-    private suspend fun performFullSync() {
+    suspend fun performFullSync() {
         if (!syncMutex.tryLock()) return
 
         try {
@@ -149,145 +260,225 @@ class FirebaseSyncEngine(
                 errorMessage = null
             )
 
-            // Step 1: Upload pending local operations to Cloud
+            // Step 1: Upload pending local operations to Firebase Firestore
             var anyUploadFailed = false
+            lastDetailedError = null
             for (op in pendingOps) {
-                val success = uploadOperationToFirebase(op)
+                val success = uploadOperationToFirestore(op)
                 if (success) {
                     dao.deleteSyncOperation(op.id)
                 } else {
                     anyUploadFailed = true
-                    dao.updateSyncStatus(op.id, "FAILED", "Sync failed at ${Date()}", op.retryCount + 1)
+                    val errText = lastDetailedError ?: "Sync failed at ${Date()}"
+                    dao.updateSyncStatus(op.id, "FAILED", errText, op.retryCount + 1)
                 }
             }
 
-            // Step 2: Download remote changes from other devices (Multi-Device Auto Sync)
+            // Step 2: Download remote changes from Firestore collections
             pullRemoteChanges()
 
             val remainingPending = dao.getPendingSyncOperations().size
             val now = System.currentTimeMillis()
             prefs.edit().putLong("last_sync_time", now).apply()
 
+            val finalErrorMsg = if (anyUploadFailed) {
+                lastDetailedError ?: "Some changes failed to upload. Auto-retry scheduled."
+            } else null
+
             _syncInfo.value = _syncInfo.value.copy(
                 state = if (anyUploadFailed) SyncState.FAILED else SyncState.SYNCED,
                 pendingCount = remainingPending,
                 lastSyncTimestamp = now,
                 lastSyncFormatted = formatTimestamp(now),
-                errorMessage = if (anyUploadFailed) "Some changes could not sync. Automatic retry scheduled." else null
+                errorMessage = finalErrorMsg
             )
         } catch (e: Exception) {
             Log.e("FirebaseSyncEngine", "Sync error", e)
             val pendingCount = dao.getPendingSyncOperations().size
+            val detailed = e.localizedMessage ?: e.message ?: e.toString()
+            lastDetailedError = detailed
             _syncInfo.value = _syncInfo.value.copy(
                 state = SyncState.FAILED,
                 pendingCount = pendingCount,
-                errorMessage = e.localizedMessage ?: "Sync error occurred"
+                errorMessage = detailed
             )
         } finally {
             syncMutex.unlock()
         }
     }
 
-    private suspend fun uploadOperationToFirebase(op: SyncOperationEntity): Boolean = withContext(Dispatchers.IO) {
-        val projectId = _syncInfo.value.projectId
+    private suspend fun uploadOperationToFirestore(op: SyncOperationEntity): Boolean = withContext(Dispatchers.IO) {
         val collectionName = getCollectionForEntityType(op.entityType)
-        val documentId = "${op.entityType.lowercase()}_${op.entityId}"
-        val urlString = "https://firestore.googleapis.com/v1/projects/$projectId/databases/(default)/documents/$collectionName/$documentId"
+        val documentId = getDocumentId(op.entityType, op.entityId)
 
         try {
-            val url = URL(urlString)
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "PATCH"
-            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-            conn.connectTimeout = 8000
-            conn.readTimeout = 8000
-            conn.doOutput = true
+            val devId = op.deviceId.ifEmpty { getDeviceId() }
+            val now = System.currentTimeMillis()
 
-            val fieldsObject = JSONObject()
-            fieldsObject.put("entityType", makeStringField(op.entityType))
-            fieldsObject.put("entityId", makeStringField(op.entityId))
-            fieldsObject.put("operation", makeStringField(op.operation))
-            fieldsObject.put("payloadJson", makeStringField(op.payloadJson))
-            fieldsObject.put("timestamp", makeIntegerField(op.timestamp))
-            fieldsObject.put("deviceId", makeStringField(op.deviceId.ifEmpty { getDeviceId() }))
-            fieldsObject.put("isDeleted", makeBooleanField(op.operation == "DELETE"))
+            if (op.operation == "DELETE") {
+                // 1. Upload to centralized pharma_tombstones
+                val tombDocId = "tomb_${op.entityType}_${op.entityId}"
+                val tombData = hashMapOf(
+                    "entityType" to op.entityType,
+                    "entityId" to op.entityId,
+                    "deletedAt" to op.timestamp,
+                    "deletedByDevice" to devId,
+                    "deletedByUser" to currentUserMobile,
+                    "isDeleted" to true,
+                    "timestamp" to op.timestamp
+                )
+                val tombTask = firestore.collection("pharma_tombstones").document(tombDocId).set(tombData, SetOptions.merge())
+                Tasks.await(tombTask, 12, TimeUnit.SECONDS)
 
-            val body = JSONObject()
-            body.put("fields", fieldsObject)
-
-            OutputStreamWriter(conn.outputStream).use { writer ->
-                writer.write(body.toString())
-                writer.flush()
-            }
-
-            val responseCode = conn.responseCode
-            // 200 OK or 201 Created
-            if (responseCode in 200..299) {
-                conn.disconnect()
+                // 2. Mark entity document in its collection as deleted
+                val entityData = hashMapOf(
+                    "entityType" to op.entityType,
+                    "entityId" to op.entityId,
+                    "operation" to "DELETE",
+                    "isDeleted" to true,
+                    "deletedAt" to op.timestamp,
+                    "timestamp" to op.timestamp,
+                    "updatedAt" to now,
+                    "deviceId" to devId,
+                    "userMobile" to currentUserMobile
+                )
+                val docRef = firestore.collection(collectionName).document(documentId)
+                val task = docRef.set(entityData, SetOptions.merge())
+                Tasks.await(task, 12, TimeUnit.SECONDS)
+                Log.d("FirebaseSyncEngine", "Uploaded deletion tombstone for ${op.entityType} ${op.entityId}")
                 return@withContext true
-            } else {
-                Log.w("FirebaseSyncEngine", "Firebase HTTP $responseCode for $documentId")
-                conn.disconnect()
-                return@withContext false
             }
+
+            // For INSERT / UPDATE: Check if record is tombstoned (prevent resurrection of deleted records)
+            if (dao.isTombstoned(op.entityType, op.entityId) > 0) {
+                Log.d("FirebaseSyncEngine", "Skipping upload of ${op.entityType} ${op.entityId} because it is tombstoned")
+                return@withContext true
+            }
+
+            val data = hashMapOf(
+                "entityType" to op.entityType,
+                "entityId" to op.entityId,
+                "operation" to op.operation,
+                "payloadJson" to op.payloadJson,
+                "timestamp" to op.timestamp,
+                "deviceId" to devId,
+                "userMobile" to currentUserMobile,
+                "isDeleted" to false,
+                "updatedAt" to now
+            )
+
+            val docRef = firestore.collection(collectionName).document(documentId)
+            val task = docRef.set(data, SetOptions.merge())
+            Tasks.await(task, 12, TimeUnit.SECONDS)
+            Log.d("FirebaseSyncEngine", "Uploaded $documentId to $collectionName successfully")
+            true
         } catch (e: Exception) {
-            Log.e("FirebaseSyncEngine", "Network failure uploading $documentId: ${e.message}")
-            return@withContext false
+            val errorDetails = "Failed to upload $collectionName/$documentId: ${e.javaClass.simpleName}: ${e.message}"
+            Log.e("FirebaseSyncEngine", errorDetails, e)
+            lastDetailedError = e.message ?: e.toString()
+            false
         }
     }
 
     private suspend fun pullRemoteChanges() = withContext(Dispatchers.IO) {
-        val projectId = _syncInfo.value.projectId
-        val collections = listOf(
-            "pharma_medicines",
-            "pharma_parties",
-            "pharma_doctors",
-            "pharma_patients",
-            "pharma_invoices",
-            "pharma_settings",
-            "pharma_guest_logins",
-            "pharma_admin_users"
-        )
         val currentDeviceId = getDeviceId()
 
-        for (coll in collections) {
-            val urlString = "https://firestore.googleapis.com/v1/projects/$projectId/databases/(default)/documents/$coll"
+        // 1. Pull tombstones first to ensure any deleted records are immediately removed
+        try {
+            val tombTask = firestore.collection("pharma_tombstones").get()
+            val tombSnapshot = Tasks.await(tombTask, 10, TimeUnit.SECONDS)
+            for (doc in tombSnapshot.documents) {
+                val entityType = doc.getString("entityType") ?: continue
+                val entityId = doc.getString("entityId") ?: continue
+                val deletedAt = doc.getLong("deletedAt") ?: doc.getLong("timestamp") ?: System.currentTimeMillis()
+                val devId = doc.getString("deletedByDevice") ?: ""
+                val user = doc.getString("deletedByUser") ?: ""
+
+                val tomb = TombstoneEntity(
+                    entityType = entityType,
+                    entityId = entityId,
+                    deletedAt = deletedAt,
+                    deviceId = devId,
+                    userMobile = user
+                )
+                dao.insertTombstone(tomb)
+                applyDeletionToRoom(entityType, entityId)
+            }
+        } catch (e: Exception) {
+            Log.w("FirebaseSyncEngine", "Error pulling tombstones from Firestore: ${e.message}")
+        }
+
+        // 2. Pull all regular business collections
+        for (collName in collectionsToSync) {
+            if (collName == "pharma_tombstones") continue
             try {
-                val url = URL(urlString)
-                val conn = url.openConnection() as HttpURLConnection
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 8000
-                conn.readTimeout = 8000
+                val queryTask = firestore.collection(collName).get()
+                val snapshot = Tasks.await(queryTask, 10, TimeUnit.SECONDS)
+                for (doc in snapshot.documents) {
+                    val docDeviceId = doc.getString("deviceId") ?: ""
+                    if (docDeviceId != currentDeviceId && docDeviceId.isNotEmpty()) {
+                        val entityType = doc.getString("entityType") ?: getEntityTypeFromCollection(collName)
+                        val entityId = doc.getString("entityId") ?: doc.id
+                        val payloadJson = doc.getString("payloadJson") ?: ""
+                        val isDeleted = doc.getBoolean("isDeleted") ?: false
+                        val remoteTimestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
 
-                if (conn.responseCode in 200..299) {
-                    val reader = BufferedReader(InputStreamReader(conn.inputStream))
-                    val responseStr = reader.readText()
-                    reader.close()
-                    conn.disconnect()
-
-                    val json = JSONObject(responseStr)
-                    val documents = json.optJSONArray("documents") ?: JSONArray()
-                    for (i in 0 until documents.length()) {
-                        val doc = documents.getJSONObject(i)
-                        val fields = doc.optJSONObject("fields") ?: continue
-                        val docDeviceId = getStringField(fields, "deviceId")
-
-                        // Only apply changes if they originated from OTHER devices (Multi-device sync)
-                        if (docDeviceId != currentDeviceId && docDeviceId.isNotEmpty()) {
-                            val entityType = getStringField(fields, "entityType")
-                            val payloadJson = getStringField(fields, "payloadJson")
-                            val isDeleted = getBooleanField(fields, "isDeleted")
-                            val remoteTimestamp = getIntegerField(fields, "timestamp")
-
-                            applyRemoteChange(entityType, payloadJson, isDeleted, remoteTimestamp)
+                        if (isDeleted) {
+                            val tomb = TombstoneEntity(
+                                entityType = entityType,
+                                entityId = entityId,
+                                deletedAt = remoteTimestamp,
+                                deviceId = docDeviceId,
+                                userMobile = doc.getString("userMobile") ?: ""
+                            )
+                            dao.insertTombstone(tomb)
+                            applyDeletionToRoom(entityType, entityId)
+                        } else if (payloadJson.isNotBlank()) {
+                            if (dao.isTombstoned(entityType, entityId) > 0) {
+                                applyDeletionToRoom(entityType, entityId)
+                            } else {
+                                applyRemoteChange(entityType, payloadJson, false, remoteTimestamp)
+                            }
                         }
                     }
-                } else {
-                    conn.disconnect()
                 }
             } catch (e: Exception) {
-                Log.w("FirebaseSyncEngine", "Error pulling collection $coll: ${e.message}")
+                Log.w("FirebaseSyncEngine", "Error pulling $collName from Firestore: ${e.message}")
             }
+        }
+    }
+
+    /**
+     * Direct cloud check for Sub-Admin login on new devices where local sync might not have finished yet.
+     */
+    suspend fun lookupSubAdminFromCloud(mobile: String, pass: String): AdminUserEntity? = withContext(Dispatchers.IO) {
+        try {
+            val queryTask = firestore.collection("pharma_admin_users")
+                .whereEqualTo("isDeleted", false)
+                .get()
+            val snapshot = Tasks.await(queryTask, 8, TimeUnit.SECONDS)
+            for (doc in snapshot.documents) {
+                val payload = doc.getString("payloadJson") ?: continue
+                val json = JSONObject(payload)
+                val docMobile = json.optString("mobileNumber", "")
+                val docPass = json.optString("password", "")
+                if (docMobile == mobile.trim() && docPass == pass.trim()) {
+                    val admin = AdminUserEntity(
+                        id = json.optLong("id", System.currentTimeMillis()),
+                        name = json.optString("name", "Admin"),
+                        mobileNumber = docMobile,
+                        password = docPass,
+                        createdByMobile = json.optString("createdByMobile", "9002625428"),
+                        createdAt = json.optLong("createdAt", System.currentTimeMillis())
+                    )
+                    dao.insertAdminUser(admin)
+                    return@withContext admin
+                }
+            }
+            null
+        } catch (e: Exception) {
+            Log.w("FirebaseSyncEngine", "Error querying sub-admin from cloud: ${e.message}")
+            null
         }
     }
 
@@ -300,93 +491,108 @@ class FirebaseSyncEngine(
         if (payloadJson.isBlank()) return
         try {
             val json = JSONObject(payloadJson)
-            when (entityType) {
+            when (entityType.uppercase()) {
                 "MEDICINE" -> {
                     val id = json.optLong("id", 0L)
-                    if (id > 0) {
-                        val local = dao.getMedicineById(id)
-                        if (isDeleted) {
-                            dao.deleteMedicineById(id)
-                        } else {
-                            if (local == null || remoteTimestamp >= local.createdAt) {
-                                val med = MedicineEntity(
-                                    id = id,
-                                    productName = json.optString("productName", ""),
-                                    productType = json.optString("productType", "Tablet"),
-                                    packagingType = json.optString("packagingType", "1×10T"),
-                                    composition = json.optString("composition", ""),
-                                    manufacturerName = json.optString("manufacturerName", ""),
-                                    companyName = json.optString("companyName", ""),
-                                    batchNumber = json.optString("batchNumber", ""),
-                                    mfgDate = json.optString("mfgDate", ""),
-                                    expiryDate = json.optString("expiryDate", ""),
-                                    mrp = json.optDouble("mrp", 0.0),
-                                    price = json.optDouble("price", 0.0),
-                                    purchaseRate = json.optDouble("purchaseRate", 0.0),
-                                    saleRate = json.optDouble("saleRate", 0.0),
-                                    gstPercent = json.optDouble("gstPercent", 12.0),
-                                    stockQuantity = json.optInt("stockQuantity", 0),
-                                    rackLocation = json.optString("rackLocation", ""),
-                                    freeQuantity = json.optInt("freeQuantity", 0),
-                                    lowStockLevel = json.optInt("lowStockLevel", 10),
-                                    createdAt = remoteTimestamp
-                                )
-                                dao.insertMedicine(med)
-                            }
-                        }
+                    val prodName = json.optString("productName", "")
+                    val batchNo = json.optString("batchNumber", "")
+                    if (isDeleted) {
+                        if (id > 0) dao.deleteMedicineById(id)
+                        val match = dao.findMedicineByNameAndBatch(prodName, batchNo)
+                        if (match != null) dao.deleteMedicineById(match.id)
+                    } else if (prodName.isNotBlank()) {
+                        val local = if (id > 0) dao.getMedicineById(id) else null
+                        val existingByNameBatch = dao.findMedicineByNameAndBatch(prodName, batchNo)
+                        val targetId = local?.id ?: existingByNameBatch?.id ?: if (id > 0) id else 0L
+
+                        val med = MedicineEntity(
+                            id = targetId,
+                            productName = prodName,
+                            productType = json.optString("productType", "Tablet"),
+                            packagingType = json.optString("packagingType", "1×10T"),
+                            composition = json.optString("composition", ""),
+                            manufacturerName = json.optString("manufacturerName", ""),
+                            companyName = json.optString("companyName", ""),
+                            batchNumber = batchNo,
+                            mfgDate = json.optString("mfgDate", ""),
+                            expiryDate = json.optString("expiryDate", ""),
+                            mrp = json.optDouble("mrp", 0.0),
+                            price = json.optDouble("price", 0.0),
+                            purchaseRate = json.optDouble("purchaseRate", 0.0),
+                            saleRate = json.optDouble("saleRate", 0.0),
+                            gstPercent = json.optDouble("gstPercent", 12.0),
+                            stockQuantity = json.optInt("stockQuantity", 0),
+                            rackLocation = json.optString("rackLocation", ""),
+                            freeQuantity = json.optInt("freeQuantity", 0),
+                            lowStockLevel = json.optInt("lowStockLevel", 10),
+                            createdAt = remoteTimestamp
+                        )
+                        dao.insertMedicine(med)
                     }
                 }
                 "PARTY" -> {
                     val id = json.optLong("id", 0L)
-                    if (id > 0) {
-                        if (isDeleted) {
-                            dao.deletePartyById(id)
-                        } else {
-                            val party = PartyEntity(
-                                id = id,
-                                partyName = json.optString("partyName", ""),
-                                dlNumber = json.optString("dlNumber", ""),
-                                gstPanNumber = json.optString("gstPanNumber", ""),
-                                contactNumber = json.optString("contactNumber", ""),
-                                address = json.optString("address", "")
-                            )
-                            dao.insertParty(party)
-                        }
+                    val partyName = json.optString("partyName", "")
+                    val contactNumber = json.optString("contactNumber", "")
+                    if (isDeleted) {
+                        if (id > 0) dao.deletePartyById(id)
+                        val existing = dao.findPartyByNameAndPhone(partyName, contactNumber)
+                        if (existing != null) dao.deletePartyById(existing.id)
+                    } else if (partyName.isNotBlank()) {
+                        val existing = dao.findPartyByNameAndPhone(partyName, contactNumber)
+                        val targetId = if (id > 0) id else (existing?.id ?: 0L)
+                        val party = PartyEntity(
+                            id = targetId,
+                            partyName = partyName,
+                            dlNumber = json.optString("dlNumber", ""),
+                            gstPanNumber = json.optString("gstPanNumber", ""),
+                            contactNumber = contactNumber,
+                            address = json.optString("address", "")
+                        )
+                        dao.insertParty(party)
                     }
                 }
                 "DOCTOR" -> {
                     val id = json.optLong("id", 0L)
-                    if (id > 0) {
-                        if (isDeleted) {
-                            dao.deleteDoctorById(id)
-                        } else {
-                            val doc = DoctorEntity(
-                                id = id,
-                                doctorName = json.optString("doctorName", ""),
-                                qualification = json.optString("qualification", ""),
-                                doctorType = json.optString("doctorType", "Allopathic"),
-                                phoneNumber = json.optString("phoneNumber", ""),
-                                address = json.optString("address", "")
-                            )
-                            dao.insertDoctor(doc)
-                        }
+                    val doctorName = json.optString("doctorName", "")
+                    val phone = json.optString("phoneNumber", "")
+                    if (isDeleted) {
+                        if (id > 0) dao.deleteDoctorById(id)
+                        val existing = dao.findDoctorByNameAndPhone(doctorName, phone)
+                        if (existing != null) dao.deleteDoctorById(existing.id)
+                    } else if (doctorName.isNotBlank()) {
+                        val existing = dao.findDoctorByNameAndPhone(doctorName, phone)
+                        val targetId = if (id > 0) id else (existing?.id ?: 0L)
+                        val doc = DoctorEntity(
+                            id = targetId,
+                            doctorName = doctorName,
+                            qualification = json.optString("qualification", ""),
+                            doctorType = json.optString("doctorType", "Allopathic"),
+                            phoneNumber = phone,
+                            address = json.optString("address", "")
+                        )
+                        dao.insertDoctor(doc)
                     }
                 }
                 "PATIENT" -> {
                     val id = json.optLong("id", 0L)
-                    if (id > 0) {
-                        if (isDeleted) {
-                            dao.deletePatientById(id)
-                        } else {
-                            val pat = PatientEntity(
-                                id = id,
-                                patientName = json.optString("patientName", ""),
-                                phoneNumber = json.optString("phoneNumber", ""),
-                                doctorName = json.optString("doctorName", ""),
-                                address = json.optString("address", "")
-                            )
-                            dao.insertPatient(pat)
-                        }
+                    val patientName = json.optString("patientName", "")
+                    val phone = json.optString("phoneNumber", "")
+                    if (isDeleted) {
+                        if (id > 0) dao.deletePatientById(id)
+                        val existing = dao.findPatientByNameAndPhone(patientName, phone)
+                        if (existing != null) dao.deletePatientById(existing.id)
+                    } else if (patientName.isNotBlank()) {
+                        val existing = dao.findPatientByNameAndPhone(patientName, phone)
+                        val targetId = if (id > 0) id else (existing?.id ?: 0L)
+                        val pat = PatientEntity(
+                            id = targetId,
+                            patientName = patientName,
+                            phoneNumber = phone,
+                            doctorName = json.optString("doctorName", ""),
+                            address = json.optString("address", "")
+                        )
+                        dao.insertPatient(pat)
                     }
                 }
                 "INVOICE" -> {
@@ -493,6 +699,7 @@ class FirebaseSyncEngine(
                                     loginTimestamp = timestamp
                                 )
                             )
+                            Log.d("FirebaseSyncEngine", "Received real-time guest login: $mobile")
                         }
                     }
                 }
@@ -502,9 +709,13 @@ class FirebaseSyncEngine(
                     if (mobile.isNotBlank()) {
                         if (isDeleted) {
                             if (id > 0) dao.deleteAdminUser(id)
+                            val existing = dao.findAdminByMobile(mobile)
+                            if (existing != null) dao.deleteAdminUser(existing.id)
                         } else {
+                            val existing = dao.findAdminByMobile(mobile)
+                            val targetId = if (id > 0) id else (existing?.id ?: 0L)
                             val admin = AdminUserEntity(
-                                id = id,
+                                id = targetId,
                                 name = json.optString("name", ""),
                                 mobileNumber = mobile,
                                 password = json.optString("password", ""),
@@ -512,6 +723,33 @@ class FirebaseSyncEngine(
                                 createdAt = json.optLong("createdAt", remoteTimestamp)
                             )
                             dao.insertAdminUser(admin)
+                            Log.d("FirebaseSyncEngine", "Received real-time admin user sync: $mobile")
+                        }
+                    }
+                }
+                "STOCK_TRANSACTION" -> {
+                    val medId = json.optLong("medicineId", 0L)
+                    val timestamp = json.optLong("timestamp", remoteTimestamp)
+                    val type = json.optString("type", "RECEIPT")
+                    val qty = json.optInt("qty", 0)
+                    if (medId > 0 && !isDeleted) {
+                        val existing = dao.findStockTransaction(medId, timestamp, type, qty)
+                        if (existing == null) {
+                            dao.insertStockTransaction(
+                                StockTransactionEntity(
+                                    medicineId = medId,
+                                    productName = json.optString("productName", ""),
+                                    companyName = json.optString("companyName", ""),
+                                    type = type,
+                                    referenceInvoice = if (json.has("referenceInvoice") && !json.isNull("referenceInvoice")) json.optLong("referenceInvoice") else null,
+                                    qty = qty,
+                                    freeQty = json.optInt("freeQty", 0),
+                                    rate = json.optDouble("rate", 0.0),
+                                    amount = json.optDouble("amount", 0.0),
+                                    timestamp = timestamp,
+                                    dateFormatted = json.optString("dateFormatted", "")
+                                )
+                            )
                         }
                     }
                 }
@@ -521,53 +759,93 @@ class FirebaseSyncEngine(
         }
     }
 
+    private suspend fun applyDeletionToRoom(entityType: String, entityId: String) {
+        try {
+            when (entityType.uppercase()) {
+                "MEDICINE" -> {
+                    val id = entityId.toLongOrNull() ?: 0L
+                    if (id > 0) dao.deleteMedicineById(id)
+                }
+                "PARTY" -> {
+                    val id = entityId.toLongOrNull() ?: 0L
+                    if (id > 0) dao.deletePartyById(id)
+                }
+                "DOCTOR" -> {
+                    val id = entityId.toLongOrNull() ?: 0L
+                    if (id > 0) dao.deleteDoctorById(id)
+                }
+                "PATIENT" -> {
+                    val id = entityId.toLongOrNull() ?: 0L
+                    if (id > 0) dao.deletePatientById(id)
+                }
+                "INVOICE" -> {
+                    val inv = entityId.toLongOrNull() ?: 0L
+                    if (inv > 0) {
+                        dao.deleteInvoiceItems(inv)
+                        dao.deleteInvoice(inv)
+                    }
+                }
+                "ADMIN_USER" -> {
+                    val id = entityId.toLongOrNull() ?: 0L
+                    if (id > 0) dao.deleteAdminUser(id)
+                }
+                "GUEST_LOGIN" -> {
+                    val id = entityId.toLongOrNull() ?: 0L
+                    if (id > 0) dao.deleteGuestLogin(id)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("FirebaseSyncEngine", "Error applying local deletion for $entityType $entityId", e)
+        }
+    }
+
     private fun getCollectionForEntityType(entityType: String): String {
         return when (entityType.uppercase()) {
             "MEDICINE" -> "pharma_medicines"
             "INVOICE" -> "pharma_invoices"
-            "INVOICE_ITEM" -> "pharma_invoice_items"
             "PARTY" -> "pharma_parties"
             "DOCTOR" -> "pharma_doctors"
             "PATIENT" -> "pharma_patients"
             "SETTINGS" -> "pharma_settings"
             "ADMIN_USER" -> "pharma_admin_users"
             "GUEST_LOGIN" -> "pharma_guest_logins"
+            "STOCK_TRANSACTION" -> "pharma_stock_transactions"
+            "TOMBSTONE" -> "pharma_tombstones"
             else -> "pharma_records"
         }
     }
 
-    private fun makeStringField(value: String): JSONObject {
-        val o = JSONObject()
-        o.put("stringValue", value)
-        return o
+    private fun getEntityTypeFromCollection(collectionName: String): String {
+        return when (collectionName) {
+            "pharma_medicines" -> "MEDICINE"
+            "pharma_invoices" -> "INVOICE"
+            "pharma_parties" -> "PARTY"
+            "pharma_doctors" -> "DOCTOR"
+            "pharma_patients" -> "PATIENT"
+            "pharma_settings" -> "SETTINGS"
+            "pharma_admin_users" -> "ADMIN_USER"
+            "pharma_guest_logins" -> "GUEST_LOGIN"
+            "pharma_stock_transactions" -> "STOCK_TRANSACTION"
+            "pharma_tombstones" -> "TOMBSTONE"
+            else -> "UNKNOWN"
+        }
     }
 
-    private fun makeIntegerField(value: Long): JSONObject {
-        val o = JSONObject()
-        o.put("integerValue", value.toString())
-        return o
-    }
-
-    private fun makeBooleanField(value: Boolean): JSONObject {
-        val o = JSONObject()
-        o.put("booleanValue", value)
-        return o
-    }
-
-    private fun getStringField(fields: JSONObject, key: String): String {
-        val fieldObj = fields.optJSONObject(key) ?: return ""
-        return fieldObj.optString("stringValue", "")
-    }
-
-    private fun getIntegerField(fields: JSONObject, key: String): Long {
-        val fieldObj = fields.optJSONObject(key) ?: return 0L
-        val str = fieldObj.optString("integerValue", "")
-        return str.toLongOrNull() ?: fieldObj.optLong("integerValue", 0L)
-    }
-
-    private fun getBooleanField(fields: JSONObject, key: String): Boolean {
-        val fieldObj = fields.optJSONObject(key) ?: return false
-        return fieldObj.optBoolean("booleanValue", false)
+    private fun getDocumentId(entityType: String, entityId: String): String {
+        val cleanId = entityId.replace("/", "_").replace(" ", "_")
+        return when (entityType.uppercase()) {
+            "MEDICINE" -> "med_$cleanId"
+            "INVOICE" -> "inv_$cleanId"
+            "PARTY" -> "party_$cleanId"
+            "DOCTOR" -> "doc_$cleanId"
+            "PATIENT" -> "pat_$cleanId"
+            "SETTINGS" -> "settings_1"
+            "ADMIN_USER" -> "admin_$cleanId"
+            "GUEST_LOGIN" -> "guest_$cleanId"
+            "STOCK_TRANSACTION" -> "st_$cleanId"
+            "TOMBSTONE" -> "tomb_$cleanId"
+            else -> "doc_$cleanId"
+        }
     }
 
     private fun formatTimestamp(timeMs: Long): String {

@@ -14,8 +14,10 @@ import com.example.util.KhataRow
 import com.example.util.NetworkMonitor
 import com.example.util.NumberToWords
 import com.example.util.StockStatementRow
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlin.random.Random
 
 class PharmaViewModel(application: Application) : AndroidViewModel(application) {
@@ -230,7 +232,7 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
             return true
         }
 
-        // 2. Check Sub-Admins
+        // 2. Check Sub-Admins locally
         val subAdmin = adminUsers.value.find { it.mobileNumber == m && it.password == p }
         if (subAdmin != null) {
             _authState.value = AuthState(
@@ -242,6 +244,28 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
             )
             _currentTab.value = NavigationTab.HOME
             return true
+        }
+
+        // 3. Fallback: Check Cloud Firestore for newly created sub-admin from another device
+        if (networkMonitor.isOnline.value) {
+            try {
+                val cloudAdmin = runBlocking(Dispatchers.IO) {
+                    syncEngine.lookupSubAdminFromCloud(m, p)
+                }
+                if (cloudAdmin != null) {
+                    _authState.value = AuthState(
+                        role = UserRole.Admin(
+                            mobile = m,
+                            isMasterAdmin = false,
+                            adminName = cloudAdmin.name.ifBlank { "Admin" }
+                        )
+                    )
+                    _currentTab.value = NavigationTab.HOME
+                    return true
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("PharmaViewModel", "Cloud admin lookup error: ${e.message}")
+            }
         }
 
         return false

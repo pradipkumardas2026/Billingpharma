@@ -74,10 +74,12 @@ class MainActivity : ComponentActivity() {
                 var newGuestNotification by remember { mutableStateOf<GuestLoginEntity?>(null) }
 
                 LaunchedEffect(guestLogins) {
-                    if (authState.isMasterAdmin && guestLogins.isNotEmpty()) {
+                    if (authState.isAdmin && guestLogins.isNotEmpty()) {
                         val latest = guestLogins.first()
-                        if (lastGuestLoginId != 0L && latest.id > lastGuestLoginId) {
-                            newGuestNotification = latest
+                        if (lastGuestLoginId != 0L && (latest.id > lastGuestLoginId || latest.loginTimestamp > (System.currentTimeMillis() - 180_000L))) {
+                            if (newGuestNotification?.id != latest.id) {
+                                newGuestNotification = latest
+                            }
                         }
                         lastGuestLoginId = latest.id
                     }

@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "461673288319",
+    "project_id": "pharma-billing-cloud",
+    "storage_bucket": "pharma-billing-cloud.appspot.com",
+    "firebase_url": "https://pharma-billing-cloud.firebaseio.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:461673288319:android:a1b2c3d4e5f60718293a4b",
+        "android_client_info": {
+          "package_name": "com.aistudio.pharmabill.kpdz"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "461673288319-android.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.aistudio.pharmabill.kpdz",
+            "certificate_hash": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+          }
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyPharmaBillingCloudClientKey2026"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

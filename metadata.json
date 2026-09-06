@@ -1,0 +1,6 @@
+{
+  "name": "PharmaBill",
+  "description": "Professional Medicine Billing, Inventory, Sales & Pharmacy Management Software",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

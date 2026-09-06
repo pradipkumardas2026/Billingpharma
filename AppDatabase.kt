@@ -18,6 +18,7 @@ import com.example.data.local.entity.PatientEntity
 import com.example.data.local.entity.SettingsEntity
 import com.example.data.local.entity.StockTransactionEntity
 import com.example.data.local.entity.SyncOperationEntity
+import com.example.data.local.entity.TombstoneEntity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -34,9 +35,10 @@ import kotlinx.coroutines.launch
         StockTransactionEntity::class,
         AdminUserEntity::class,
         GuestLoginEntity::class,
-        SyncOperationEntity::class
+        SyncOperationEntity::class,
+        TombstoneEntity::class
     ],
-    version = 6,
+    version = 7,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -105,6 +107,21 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS sync_tombstones (
+                        entityType TEXT NOT NULL,
+                        entityId TEXT NOT NULL,
+                        deletedAt INTEGER NOT NULL,
+                        deviceId TEXT NOT NULL,
+                        userMobile TEXT NOT NULL,
+                        PRIMARY KEY(entityType, entityId)
+                    )
+                """.trimIndent())
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -112,7 +129,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "pharmabill_db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
                     .fallbackToDestructiveMigration()
                     .addCallback(DatabaseCallback())
                     .build()

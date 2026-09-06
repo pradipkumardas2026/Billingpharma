@@ -12,6 +12,7 @@ import com.example.data.local.entity.PatientEntity
 import com.example.data.local.entity.SettingsEntity
 import com.example.data.local.entity.StockTransactionEntity
 import com.example.data.local.entity.SyncOperationEntity
+import com.example.data.local.entity.TombstoneEntity
 import com.example.data.sync.FirebaseSyncEngine
 import com.example.data.sync.SyncSerializer
 import com.example.util.DateUtils
@@ -58,21 +59,21 @@ class PharmaRepository(
         val id = dao.insertMedicine(medicine)
         if (medicine.stockQuantity > 0 || medicine.freeQuantity > 0) {
             val rate = if (medicine.purchaseRate > 0.0) medicine.purchaseRate else medicine.price
-            dao.insertStockTransaction(
-                StockTransactionEntity(
-                    medicineId = id,
-                    productName = medicine.productName,
-                    companyName = if (medicine.companyName.isNotBlank()) medicine.companyName else medicine.manufacturerName,
-                    type = "RECEIPT",
-                    referenceInvoice = null,
-                    qty = medicine.stockQuantity,
-                    freeQty = medicine.freeQuantity,
-                    rate = rate,
-                    amount = medicine.stockQuantity * rate,
-                    timestamp = if (medicine.createdAt > 0) medicine.createdAt else System.currentTimeMillis(),
-                    dateFormatted = DateUtils.currentDateString()
-                )
+            val st = StockTransactionEntity(
+                medicineId = id,
+                productName = medicine.productName,
+                companyName = if (medicine.companyName.isNotBlank()) medicine.companyName else medicine.manufacturerName,
+                type = "RECEIPT",
+                referenceInvoice = null,
+                qty = medicine.stockQuantity,
+                freeQty = medicine.freeQuantity,
+                rate = rate,
+                amount = medicine.stockQuantity * rate,
+                timestamp = if (medicine.createdAt > 0) medicine.createdAt else System.currentTimeMillis(),
+                dateFormatted = DateUtils.currentDateString()
             )
+            val stId = dao.insertStockTransaction(st)
+            queueSync("STOCK_TRANSACTION", "${id}_${st.timestamp}_RECEIPT_${st.qty}", "INSERT", SyncSerializer.stockTransactionToJson(st.copy(id = stId)))
         }
         val insertedMed = dao.getMedicineById(id) ?: medicine.copy(id = id)
         queueSync("MEDICINE", id.toString(), "INSERT", SyncSerializer.medicineToJson(insertedMed))
@@ -85,39 +86,39 @@ class PharmaRepository(
             val diff = medicine.stockQuantity - existing.stockQuantity
             if (diff > 0) {
                 val rate = if (medicine.purchaseRate > 0.0) medicine.purchaseRate else medicine.price
-                dao.insertStockTransaction(
-                    StockTransactionEntity(
-                        medicineId = medicine.id,
-                        productName = medicine.productName,
-                        companyName = if (medicine.companyName.isNotBlank()) medicine.companyName else medicine.manufacturerName,
-                        type = "RECEIPT",
-                        referenceInvoice = null,
-                        qty = diff,
-                        freeQty = (medicine.freeQuantity - existing.freeQuantity).coerceAtLeast(0),
-                        rate = rate,
-                        amount = diff * rate,
-                        timestamp = System.currentTimeMillis(),
-                        dateFormatted = DateUtils.currentDateString()
-                    )
+                val st = StockTransactionEntity(
+                    medicineId = medicine.id,
+                    productName = medicine.productName,
+                    companyName = if (medicine.companyName.isNotBlank()) medicine.companyName else medicine.manufacturerName,
+                    type = "RECEIPT",
+                    referenceInvoice = null,
+                    qty = diff,
+                    freeQty = (medicine.freeQuantity - existing.freeQuantity).coerceAtLeast(0),
+                    rate = rate,
+                    amount = diff * rate,
+                    timestamp = System.currentTimeMillis(),
+                    dateFormatted = DateUtils.currentDateString()
                 )
+                val stId = dao.insertStockTransaction(st)
+                queueSync("STOCK_TRANSACTION", "${medicine.id}_${st.timestamp}_RECEIPT_${st.qty}", "INSERT", SyncSerializer.stockTransactionToJson(st.copy(id = stId)))
             } else if (diff < 0) {
                 val issueQty = -diff
                 val rate = if (medicine.saleRate > 0.0) medicine.saleRate else medicine.price
-                dao.insertStockTransaction(
-                    StockTransactionEntity(
-                        medicineId = medicine.id,
-                        productName = medicine.productName,
-                        companyName = if (medicine.companyName.isNotBlank()) medicine.companyName else medicine.manufacturerName,
-                        type = "ISSUE",
-                        referenceInvoice = null,
-                        qty = issueQty,
-                        freeQty = 0,
-                        rate = rate,
-                        amount = issueQty * rate,
-                        timestamp = System.currentTimeMillis(),
-                        dateFormatted = DateUtils.currentDateString()
-                    )
+                val st = StockTransactionEntity(
+                    medicineId = medicine.id,
+                    productName = medicine.productName,
+                    companyName = if (medicine.companyName.isNotBlank()) medicine.companyName else medicine.manufacturerName,
+                    type = "ISSUE",
+                    referenceInvoice = null,
+                    qty = issueQty,
+                    freeQty = 0,
+                    rate = rate,
+                    amount = issueQty * rate,
+                    timestamp = System.currentTimeMillis(),
+                    dateFormatted = DateUtils.currentDateString()
                 )
+                val stId = dao.insertStockTransaction(st)
+                queueSync("STOCK_TRANSACTION", "${medicine.id}_${st.timestamp}_ISSUE_${st.qty}", "INSERT", SyncSerializer.stockTransactionToJson(st.copy(id = stId)))
             }
         }
         dao.updateMedicine(medicine)
@@ -125,9 +126,17 @@ class PharmaRepository(
     }
 
     suspend fun deleteMedicine(id: Long) {
+        val tomb = TombstoneEntity(
+            entityType = "MEDICINE",
+            entityId = id.toString(),
+            deletedAt = System.currentTimeMillis(),
+            deviceId = syncEngine?.getDeviceId() ?: "",
+            userMobile = syncEngine?.getCurrentUserMobile() ?: ""
+        )
+        dao.insertTombstone(tomb)
         dao.deleteStockTransactionsForMedicine(id)
         dao.deleteMedicineById(id)
-        queueSync("MEDICINE", id.toString(), "DELETE", "{\"id\":$id}")
+        queueSync("MEDICINE", id.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb))
     }
 
     suspend fun addStockToMedicine(
@@ -154,21 +163,21 @@ class PharmaRepository(
         dao.updateMedicine(updatedMed)
         queueSync("MEDICINE", med.id.toString(), "UPDATE", SyncSerializer.medicineToJson(updatedMed))
         val rate = newPurchaseRate ?: (if (med.purchaseRate > 0.0) med.purchaseRate else med.price)
-        dao.insertStockTransaction(
-            StockTransactionEntity(
-                medicineId = med.id,
-                productName = med.productName,
-                companyName = if (med.companyName.isNotBlank()) med.companyName else med.manufacturerName,
-                type = "RECEIPT",
-                referenceInvoice = null,
-                qty = addedQty,
-                freeQty = addedFreeQty,
-                rate = rate,
-                amount = addedQty * rate,
-                timestamp = System.currentTimeMillis(),
-                dateFormatted = DateUtils.currentDateString()
-            )
+        val st = StockTransactionEntity(
+            medicineId = med.id,
+            productName = med.productName,
+            companyName = if (med.companyName.isNotBlank()) med.companyName else med.manufacturerName,
+            type = "RECEIPT",
+            referenceInvoice = null,
+            qty = addedQty,
+            freeQty = addedFreeQty,
+            rate = rate,
+            amount = addedQty * rate,
+            timestamp = System.currentTimeMillis(),
+            dateFormatted = DateUtils.currentDateString()
         )
+        val stId = dao.insertStockTransaction(st)
+        queueSync("STOCK_TRANSACTION", "${med.id}_${st.timestamp}_RECEIPT_${st.qty}", "INSERT", SyncSerializer.stockTransactionToJson(st.copy(id = stId)))
     }
 
     fun getAllParties(): Flow<List<PartyEntity>> = dao.getAllParties()
@@ -201,8 +210,16 @@ class PharmaRepository(
     }
 
     suspend fun deleteParty(id: Long) {
+        val tomb = TombstoneEntity(
+            entityType = "PARTY",
+            entityId = id.toString(),
+            deletedAt = System.currentTimeMillis(),
+            deviceId = syncEngine?.getDeviceId() ?: "",
+            userMobile = syncEngine?.getCurrentUserMobile() ?: ""
+        )
+        dao.insertTombstone(tomb)
         dao.deletePartyById(id)
-        queueSync("PARTY", id.toString(), "DELETE", "{\"id\":$id}")
+        queueSync("PARTY", id.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb))
     }
 
     fun getAllDoctors(): Flow<List<DoctorEntity>> = dao.getAllDoctors()
@@ -234,8 +251,16 @@ class PharmaRepository(
     }
 
     suspend fun deleteDoctor(id: Long) {
+        val tomb = TombstoneEntity(
+            entityType = "DOCTOR",
+            entityId = id.toString(),
+            deletedAt = System.currentTimeMillis(),
+            deviceId = syncEngine?.getDeviceId() ?: "",
+            userMobile = syncEngine?.getCurrentUserMobile() ?: ""
+        )
+        dao.insertTombstone(tomb)
         dao.deleteDoctorById(id)
-        queueSync("DOCTOR", id.toString(), "DELETE", "{\"id\":$id}")
+        queueSync("DOCTOR", id.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb))
     }
 
     fun getAllPatients(): Flow<List<PatientEntity>> = dao.getAllPatients()
@@ -267,8 +292,16 @@ class PharmaRepository(
     }
 
     suspend fun deletePatient(id: Long) {
+        val tomb = TombstoneEntity(
+            entityType = "PATIENT",
+            entityId = id.toString(),
+            deletedAt = System.currentTimeMillis(),
+            deviceId = syncEngine?.getDeviceId() ?: "",
+            userMobile = syncEngine?.getCurrentUserMobile() ?: ""
+        )
+        dao.insertTombstone(tomb)
         dao.deletePatientById(id)
-        queueSync("PATIENT", id.toString(), "DELETE", "{\"id\":$id}")
+        queueSync("PATIENT", id.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb))
     }
 
     fun getAllInvoices(): Flow<List<InvoiceEntity>> = dao.getAllInvoices()
@@ -293,21 +326,21 @@ class PharmaRepository(
         dao.insertInvoiceItems(items)
         for (item in items) {
             dao.deductStock(item.medicineId, item.qty, item.freeQty)
-            dao.insertStockTransaction(
-                StockTransactionEntity(
-                    medicineId = item.medicineId,
-                    productName = item.productName,
-                    companyName = item.manufacturer,
-                    type = "SALE",
-                    referenceInvoice = invoice.invoiceNumber,
-                    qty = item.qty,
-                    freeQty = item.freeQty,
-                    rate = item.price,
-                    amount = item.itemTotalAmount,
-                    timestamp = invoice.date,
-                    dateFormatted = invoice.dateFormatted
-                )
+            val st = StockTransactionEntity(
+                medicineId = item.medicineId,
+                productName = item.productName,
+                companyName = item.manufacturer,
+                type = "SALE",
+                referenceInvoice = invoice.invoiceNumber,
+                qty = item.qty,
+                freeQty = item.freeQty,
+                rate = item.price,
+                amount = item.itemTotalAmount,
+                timestamp = invoice.date,
+                dateFormatted = invoice.dateFormatted
             )
+            val stId = dao.insertStockTransaction(st)
+            queueSync("STOCK_TRANSACTION", "${st.medicineId}_${st.timestamp}_SALE_${st.qty}", "INSERT", SyncSerializer.stockTransactionToJson(st.copy(id = stId)))
         }
         queueSync("INVOICE", invoice.invoiceNumber.toString(), "INSERT", SyncSerializer.invoiceToJson(invoice, items))
     }
@@ -324,21 +357,21 @@ class PharmaRepository(
         dao.insertInvoiceItems(newItems)
         for (item in newItems) {
             dao.deductStock(item.medicineId, item.qty, item.freeQty)
-            dao.insertStockTransaction(
-                StockTransactionEntity(
-                    medicineId = item.medicineId,
-                    productName = item.productName,
-                    companyName = item.manufacturer,
-                    type = "SALE",
-                    referenceInvoice = updatedInvoice.invoiceNumber,
-                    qty = item.qty,
-                    freeQty = item.freeQty,
-                    rate = item.price,
-                    amount = item.itemTotalAmount,
-                    timestamp = updatedInvoice.date,
-                    dateFormatted = updatedInvoice.dateFormatted
-                )
+            val st = StockTransactionEntity(
+                medicineId = item.medicineId,
+                productName = item.productName,
+                companyName = item.manufacturer,
+                type = "SALE",
+                referenceInvoice = updatedInvoice.invoiceNumber,
+                qty = item.qty,
+                freeQty = item.freeQty,
+                rate = item.price,
+                amount = item.itemTotalAmount,
+                timestamp = updatedInvoice.date,
+                dateFormatted = updatedInvoice.dateFormatted
             )
+            val stId = dao.insertStockTransaction(st)
+            queueSync("STOCK_TRANSACTION", "${st.medicineId}_${st.timestamp}_SALE_${st.qty}", "INSERT", SyncSerializer.stockTransactionToJson(st.copy(id = stId)))
         }
         queueSync("INVOICE", updatedInvoice.invoiceNumber.toString(), "UPDATE", SyncSerializer.invoiceToJson(updatedInvoice, newItems))
     }
@@ -351,7 +384,15 @@ class PharmaRepository(
         dao.deleteStockTransactionsForInvoice(invoiceNumber)
         dao.deleteInvoiceItems(invoiceNumber)
         dao.deleteInvoice(invoiceNumber)
-        queueSync("INVOICE", invoiceNumber.toString(), "DELETE", "{\"invoiceNumber\":$invoiceNumber}")
+        val tomb = TombstoneEntity(
+            entityType = "INVOICE",
+            entityId = invoiceNumber.toString(),
+            deletedAt = System.currentTimeMillis(),
+            deviceId = syncEngine?.getDeviceId() ?: "",
+            userMobile = syncEngine?.getCurrentUserMobile() ?: ""
+        )
+        dao.insertTombstone(tomb)
+        queueSync("INVOICE", invoiceNumber.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb))
     }
 
     suspend fun recordPayment(invoiceNumber: Long, paymentAmount: Double) {
@@ -398,8 +439,16 @@ class PharmaRepository(
     }
 
     suspend fun deleteAdminUser(id: Long) {
+        val tomb = TombstoneEntity(
+            entityType = "ADMIN_USER",
+            entityId = id.toString(),
+            deletedAt = System.currentTimeMillis(),
+            deviceId = syncEngine?.getDeviceId() ?: "",
+            userMobile = syncEngine?.getCurrentUserMobile() ?: ""
+        )
+        dao.insertTombstone(tomb)
         dao.deleteAdminUser(id)
-        queueSync("ADMIN_USER", id.toString(), "DELETE", "{\"id\":$id}")
+        queueSync("ADMIN_USER", id.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb))
     }
 
     // Guest Logins Tracking & Multi-Device Sync
@@ -419,8 +468,16 @@ class PharmaRepository(
     }
 
     suspend fun deleteGuestLogin(id: Long) {
+        val tomb = TombstoneEntity(
+            entityType = "GUEST_LOGIN",
+            entityId = id.toString(),
+            deletedAt = System.currentTimeMillis(),
+            deviceId = syncEngine?.getDeviceId() ?: "",
+            userMobile = syncEngine?.getCurrentUserMobile() ?: ""
+        )
+        dao.insertTombstone(tomb)
         dao.deleteGuestLogin(id)
-        queueSync("GUEST_LOGIN", id.toString(), "DELETE", "{\"id\":$id}")
+        queueSync("GUEST_LOGIN", id.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb))
         syncEngine?.triggerAutomaticSync()
     }
 

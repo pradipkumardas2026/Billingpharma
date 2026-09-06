@@ -150,4 +150,31 @@ object SyncSerializer {
         json.put("createdAt", a.createdAt)
         return json.toString()
     }
+
+    fun stockTransactionToJson(st: StockTransactionEntity): String {
+        val json = JSONObject()
+        json.put("id", st.id)
+        json.put("medicineId", st.medicineId)
+        json.put("productName", st.productName)
+        json.put("companyName", st.companyName)
+        json.put("type", st.type)
+        json.put("referenceInvoice", st.referenceInvoice ?: 0L)
+        json.put("qty", st.qty)
+        json.put("freeQty", st.freeQty)
+        json.put("rate", st.rate)
+        json.put("amount", st.amount)
+        json.put("timestamp", st.timestamp)
+        json.put("dateFormatted", st.dateFormatted)
+        return json.toString()
+    }
+
+    fun tombstoneToJson(t: TombstoneEntity): String {
+        val json = JSONObject()
+        json.put("entityType", t.entityType)
+        json.put("entityId", t.entityId)
+        json.put("deletedAt", t.deletedAt)
+        json.put("deviceId", t.deviceId)
+        json.put("userMobile", t.userMobile)
+        return json.toString()
+    }
 }

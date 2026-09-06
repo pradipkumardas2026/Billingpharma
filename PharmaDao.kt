@@ -16,6 +16,7 @@ import com.example.data.local.entity.PatientEntity
 import com.example.data.local.entity.SettingsEntity
 import com.example.data.local.entity.StockTransactionEntity
 import com.example.data.local.entity.SyncOperationEntity
+import com.example.data.local.entity.TombstoneEntity
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -150,7 +151,7 @@ interface PharmaDao {
     suspend fun getTransactionsBetween(startTime: Long, endTime: Long): List<StockTransactionEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertStockTransaction(transaction: StockTransactionEntity)
+    suspend fun insertStockTransaction(transaction: StockTransactionEntity): Long
 
     @Query("DELETE FROM stock_transactions WHERE referenceInvoice = :invoiceNumber")
     suspend fun deleteStockTransactionsForInvoice(invoiceNumber: Long)
@@ -263,4 +264,42 @@ interface PharmaDao {
 
     @Query("DELETE FROM sync_operations WHERE status = 'SYNCED'")
     suspend fun clearSyncedOperations()
+
+    // Deduplication & Conflict-Resolution Lookups
+    @Query("SELECT * FROM stock_transactions WHERE medicineId = :medicineId AND timestamp = :timestamp AND type = :type AND qty = :qty LIMIT 1")
+    suspend fun findStockTransaction(medicineId: Long, timestamp: Long, type: String, qty: Int): StockTransactionEntity?
+
+    @Query("SELECT * FROM medicines WHERE productName = :name AND batchNumber = :batch LIMIT 1")
+    suspend fun findMedicineByNameAndBatch(name: String, batch: String): MedicineEntity?
+
+    @Query("SELECT * FROM parties WHERE partyName = :name AND contactNumber = :phone LIMIT 1")
+    suspend fun findPartyByNameAndPhone(name: String, phone: String): PartyEntity?
+
+    @Query("SELECT * FROM doctors WHERE doctorName = :name AND phoneNumber = :phone LIMIT 1")
+    suspend fun findDoctorByNameAndPhone(name: String, phone: String): DoctorEntity?
+
+    @Query("SELECT * FROM patients WHERE patientName = :name AND phoneNumber = :phone LIMIT 1")
+    suspend fun findPatientByNameAndPhone(name: String, phone: String): PatientEntity?
+
+    @Query("SELECT * FROM admin_users WHERE mobileNumber = :mobile LIMIT 1")
+    suspend fun findAdminByMobile(mobile: String): AdminUserEntity?
+
+    // Sync Deletion Tombstones (Prevents Deleted Records from Reappearing)
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTombstone(tombstone: TombstoneEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTombstones(tombstones: List<TombstoneEntity>)
+
+    @Query("SELECT * FROM sync_tombstones WHERE entityType = :entityType AND entityId = :entityId LIMIT 1")
+    suspend fun getTombstone(entityType: String, entityId: String): TombstoneEntity?
+
+    @Query("SELECT COUNT(*) FROM sync_tombstones WHERE entityType = :entityType AND entityId = :entityId")
+    suspend fun isTombstoned(entityType: String, entityId: String): Int
+
+    @Query("SELECT * FROM sync_tombstones")
+    suspend fun getAllTombstones(): List<TombstoneEntity>
+
+    @Query("DELETE FROM sync_tombstones WHERE entityType = :entityType AND entityId = :entityId")
+    suspend fun deleteTombstone(entityType: String, entityId: String)
 }

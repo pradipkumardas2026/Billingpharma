@@ -157,6 +157,15 @@ fun SyncStatusDialog(
                             value = syncInfo.projectId,
                             valueColor = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+
+                        if (!syncInfo.errorMessage.isNullOrBlank()) {
+                            Divider(modifier = Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                            StatusRow(
+                                label = "Error Detail",
+                                value = syncInfo.errorMessage ?: "",
+                                valueColor = AlertRed
+                            )
+                        }
                     }
                 }
 
@@ -225,8 +234,8 @@ fun SyncStatusDialog(
                         ) {
                             TextButton(
                                 onClick = {
-                                    projectIdInput = "pharmabill-cloud-sync"
-                                    viewModel.updateFirebaseProjectId("pharmabill-cloud-sync")
+                                    projectIdInput = "pharma-billing-cloud"
+                                    viewModel.updateFirebaseProjectId("pharma-billing-cloud")
                                 }
                             ) {
                                 Text("Reset Default")
