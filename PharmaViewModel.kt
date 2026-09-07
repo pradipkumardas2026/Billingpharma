@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.local.AppDatabase
 import com.example.data.local.entity.*
 import com.example.data.repository.PharmaRepository
+import com.example.data.sync.AppUpdateState
 import com.example.data.sync.FirebaseSyncEngine
 import com.example.data.sync.SyncInfo
 import com.example.data.sync.SyncState
@@ -50,6 +51,8 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
     val stockTransactions: StateFlow<List<StockTransactionEntity>>
     val adminUsers: StateFlow<List<AdminUserEntity>>
     val guestLogins: StateFlow<List<GuestLoginEntity>>
+    val purchaseInvoices: StateFlow<List<PurchaseInvoiceEntity>>
+    val appUpdateState: StateFlow<AppUpdateState>
 
     val editingInvoiceNumber = MutableStateFlow<Long?>(null)
     val billCustomerType = MutableStateFlow("PARTY")
@@ -197,6 +200,11 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
 
         guestLogins = repository.getAllGuestLogins()
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+        purchaseInvoices = repository.getAllPurchaseInvoices()
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+        appUpdateState = repository.appUpdateState
 
         // Ensure default Master Admin credentials 9002625428 / 654321 if old template defaults are present
         viewModelScope.launch {
@@ -556,6 +564,23 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    // Purchase Invoice & Purchase GST operations
+    fun addOrUpdatePurchaseInvoice(purchase: PurchaseInvoiceEntity) {
+        viewModelScope.launch {
+            if (purchase.id == 0L) {
+                repository.insertPurchaseInvoice(purchase)
+            } else {
+                repository.updatePurchaseInvoice(purchase)
+            }
+        }
+    }
+
+    fun deletePurchaseInvoice(id: Long) {
+        viewModelScope.launch {
+            repository.deletePurchaseInvoice(id)
+        }
+    }
+
     fun updateSettings(newSettings: SettingsEntity) {
         viewModelScope.launch {
             repository.updateSettings(newSettings)
@@ -628,11 +653,49 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
         doctor?.let { customDoctorName.value = it }
     }
 
+    fun getItemsForInvoiceFlow(invoiceNumber: Long): Flow<List<InvoiceItemEntity>> = repository.getItemsForInvoiceFlow(invoiceNumber)
+    suspend fun getItemsForInvoice(invoiceNumber: Long): List<InvoiceItemEntity> = repository.getItemsForInvoice(invoiceNumber)
+
     fun saveOrFinalizeCurrentBill(onSaved: (InvoiceEntity?) -> Unit) {
         viewModelScope.launch {
             val num = saveOrFinalizeCurrentBill()
             val inv = num?.let { repository.getInvoice(it) }
             onSaved(inv)
+        }
+    }
+
+    fun saveOrFinalizeCurrentBillWithItems(onSaved: (InvoiceEntity?, List<InvoiceItemEntity>) -> Unit) {
+        viewModelScope.launch {
+            val itemsSnapshot = billItems.value
+            val num = saveOrFinalizeCurrentBill()
+            val inv = num?.let { repository.getInvoice(it) }
+            val savedItems = if (num != null) repository.getItemsForInvoice(num) else emptyList()
+            val finalItems = if (savedItems.isNotEmpty()) savedItems else {
+                itemsSnapshot.mapIndexed { index, item ->
+                    InvoiceItemEntity(
+                        id = 0L,
+                        invoiceNumber = num ?: 0L,
+                        slNo = index + 1,
+                        medicineId = item.medicineId,
+                        productName = item.productName,
+                        manufacturer = item.manufacturer,
+                        pack = item.pack,
+                        batchNo = item.batchNo,
+                        expDate = item.expDate,
+                        qty = item.qty,
+                        freeQty = item.freeQty,
+                        mrp = item.mrp,
+                        price = item.price,
+                        discountPercent = item.discountPercent,
+                        bonusPercent = item.bonusPercent,
+                        sgstPercent = item.sgstPercent,
+                        cgstPercent = item.cgstPercent,
+                        netRate = item.netRate,
+                        itemTotalAmount = item.itemTotalAmount
+                    )
+                }
+            }
+            onSaved(inv, finalItems)
         }
     }
 
@@ -1021,6 +1084,18 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun deleteInvoice(invoiceNumber: Long) {
+        deleteBill(invoiceNumber)
+    }
+
+    fun startEditInvoice(invoice: InvoiceEntity) {
+        loadInvoiceForEdit(invoice)
+    }
+
+    fun navigateTo(tab: NavigationTab) {
+        switchTab(tab)
+    }
+
     fun recordPayment(invoiceNumber: Long, amount: Double) {
         viewModelScope.launch {
             repository.recordPayment(invoiceNumber, amount)
@@ -1069,7 +1144,7 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
             // Transactions strictly before the selected start date
             val txBefore = effectiveTxList.filter { it.timestamp < startTime }
             val receiptQtyBefore = txBefore.filter { it.type == "PURCHASE" || it.type == "RECEIPT" }.sumOf { it.qty }
-            val issueQtyBefore = txBefore.filter { it.type == "SALE" || it.type == "ISSUE" }.sumOf { it.qty }
+            val issueQtyBefore = txBefore.filter { it.type == "SALE" || it.type == "ISSUE" }.sumOf { it.qty + it.freeQty }
             val openingQty = (receiptQtyBefore - issueQtyBefore).coerceAtLeast(0)
 
             // Transactions within the selected period [startTime..endTime]
@@ -1078,7 +1153,7 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
             val receiptAmount = txPeriod.filter { it.type == "PURCHASE" || it.type == "RECEIPT" }.sumOf { it.amount }
                 .let { if (it > 0.0) it else receiptQty * (if (med.purchaseRate > 0.0) med.purchaseRate else med.price) }
 
-            val issueQty = txPeriod.filter { it.type == "SALE" || it.type == "ISSUE" }.sumOf { it.qty }
+            val issueQty = txPeriod.filter { it.type == "SALE" || it.type == "ISSUE" }.sumOf { it.qty + it.freeQty }
             val issueAmount = txPeriod.filter { it.type == "SALE" || it.type == "ISSUE" }.sumOf { it.amount }
                 .let { if (it > 0.0) it else issueQty * (if (med.saleRate > 0.0) med.saleRate else med.price) }
 
@@ -1158,6 +1233,20 @@ class PharmaViewModel(application: Application) : AndroidViewModel(application) 
 
     fun updateDeviceName(name: String) {
         syncEngine.setDeviceName(name)
+    }
+
+    fun checkAppUpdate(onResult: ((AppUpdateState) -> Unit)? = null) {
+        viewModelScope.launch {
+            val state = repository.checkAppUpdateManually()
+            onResult?.invoke(state)
+        }
+    }
+
+    fun publishAppUpdate(versionName: String, versionCode: Int, releaseNotes: String, updateUrl: String, onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val success = repository.publishAppUpdate(versionName, versionCode, releaseNotes, updateUrl)
+            onResult(success)
+        }
     }
 
     override fun onCleared() {

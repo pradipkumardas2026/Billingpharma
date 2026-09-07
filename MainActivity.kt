@@ -142,6 +142,23 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
 
+                                    if (authState.isMasterAdmin) {
+                                        IconButton(
+                                            onClick = { viewModel.switchTab(NavigationTab.GST) },
+                                            modifier = Modifier.testTag("gst_top_nav_btn")
+                                        ) {
+                                            BadgedBox(
+                                                badge = {
+                                                    Badge(containerColor = AlertRed) {
+                                                        Text("GST", color = PureWhite, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                                    }
+                                                }
+                                            ) {
+                                                Icon(Icons.Default.ReceiptLong, contentDescription = "GST Register", tint = PureWhite)
+                                            }
+                                        }
+                                    }
+
                                     IconButton(
                                         onClick = { showStockStatementDialog = true },
                                         modifier = Modifier.testTag("stock_statement_btn")
@@ -294,7 +311,8 @@ class MainActivity : ComponentActivity() {
                                         onViewInvoice = { selectedInvoiceForView = it },
                                         onEditInvoice = { inv ->
                                             viewModel.loadInvoiceForEdit(inv)
-                                        }
+                                        },
+                                        onOpenKhata = { showKhataDialog = true }
                                     )
                                 }
                                 NavigationTab.SALES_HISTORY -> {
@@ -309,6 +327,12 @@ class MainActivity : ComponentActivity() {
                                     SettingsScreen(
                                         viewModel = viewModel,
                                         onDismiss = { viewModel.switchTab(NavigationTab.HOME) }
+                                    )
+                                }
+                                NavigationTab.GST -> {
+                                    GstScreen(
+                                        viewModel = viewModel,
+                                        onBack = { viewModel.switchTab(NavigationTab.HOME) }
                                     )
                                 }
                             }

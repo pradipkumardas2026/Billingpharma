@@ -9,14 +9,18 @@ import com.example.data.local.entity.InvoiceItemEntity
 import com.example.data.local.entity.MedicineEntity
 import com.example.data.local.entity.PartyEntity
 import com.example.data.local.entity.PatientEntity
+import com.example.data.local.entity.PurchaseInvoiceEntity
 import com.example.data.local.entity.SettingsEntity
 import com.example.data.local.entity.StockTransactionEntity
 import com.example.data.local.entity.SyncOperationEntity
 import com.example.data.local.entity.TombstoneEntity
+import com.example.data.sync.AppUpdateState
 import com.example.data.sync.FirebaseSyncEngine
 import com.example.data.sync.SyncSerializer
 import com.example.util.DateUtils
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 class PharmaRepository(
     private val dao: PharmaDao,
@@ -25,17 +29,30 @@ class PharmaRepository(
 
     private suspend fun queueSync(entityType: String, entityId: String, operation: String, payloadJson: String) {
         try {
-            dao.insertSyncOperation(
-                SyncOperationEntity(
-                    entityType = entityType,
-                    entityId = entityId,
-                    operation = operation,
-                    payloadJson = payloadJson,
-                    timestamp = System.currentTimeMillis(),
-                    status = "PENDING",
-                    deviceId = syncEngine?.getDeviceId() ?: ""
+            val existing = dao.getPendingOpForEntity(entityType, entityId)
+            if (existing != null) {
+                dao.updateSyncOperation(
+                    existing.copy(
+                        operation = operation,
+                        payloadJson = payloadJson,
+                        timestamp = System.currentTimeMillis(),
+                        status = "PENDING",
+                        errorMessage = null
+                    )
                 )
-            )
+            } else {
+                dao.insertSyncOperation(
+                    SyncOperationEntity(
+                        entityType = entityType,
+                        entityId = entityId,
+                        operation = operation,
+                        payloadJson = payloadJson,
+                        timestamp = System.currentTimeMillis(),
+                        status = "PENDING",
+                        deviceId = syncEngine?.getDeviceId() ?: ""
+                    )
+                )
+            }
             syncEngine?.triggerAutomaticSync()
         } catch (_: Exception) {}
     }
@@ -380,6 +397,10 @@ class PharmaRepository(
         val items = dao.getItemsForInvoice(invoiceNumber)
         for (item in items) {
             dao.reverseStock(item.medicineId, item.qty, item.freeQty)
+            val updatedMed = dao.getMedicineById(item.medicineId)
+            if (updatedMed != null) {
+                queueSync("MEDICINE", updatedMed.id.toString(), "UPDATE", SyncSerializer.medicineToJson(updatedMed))
+            }
         }
         dao.deleteStockTransactionsForInvoice(invoiceNumber)
         dao.deleteInvoiceItems(invoiceNumber)
@@ -393,6 +414,7 @@ class PharmaRepository(
         )
         dao.insertTombstone(tomb)
         queueSync("INVOICE", invoiceNumber.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb))
+        syncEngine?.triggerAutomaticSync()
     }
 
     suspend fun recordPayment(invoiceNumber: Long, paymentAmount: Double) {
@@ -468,18 +490,68 @@ class PharmaRepository(
     }
 
     suspend fun deleteGuestLogin(id: Long) {
+        val entry = dao.getGuestLoginById(id)
+        val syncKey = if (entry != null) "${entry.mobileNumber}_${entry.loginTimestamp}" else id.toString()
         val tomb = TombstoneEntity(
             entityType = "GUEST_LOGIN",
-            entityId = id.toString(),
+            entityId = syncKey,
             deletedAt = System.currentTimeMillis(),
             deviceId = syncEngine?.getDeviceId() ?: "",
             userMobile = syncEngine?.getCurrentUserMobile() ?: ""
         )
         dao.insertTombstone(tomb)
         dao.deleteGuestLogin(id)
-        queueSync("GUEST_LOGIN", id.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb))
+        queueSync("GUEST_LOGIN", syncKey, "DELETE", SyncSerializer.tombstoneToJson(tomb))
+        if (syncKey != id.toString()) {
+            queueSync("GUEST_LOGIN", id.toString(), "DELETE", SyncSerializer.tombstoneToJson(tomb.copy(entityId = id.toString())))
+        }
         syncEngine?.triggerAutomaticSync()
     }
 
-    suspend fun clearGuestLogins() = dao.clearGuestLogins()
+    suspend fun clearGuestLogins() {
+        val all = dao.getAllGuestLoginsList()
+        for (entry in all) {
+            val syncKey = "${entry.mobileNumber}_${entry.loginTimestamp}"
+            val tomb = TombstoneEntity(
+                entityType = "GUEST_LOGIN",
+                entityId = syncKey,
+                deletedAt = System.currentTimeMillis(),
+                deviceId = syncEngine?.getDeviceId() ?: "",
+                userMobile = syncEngine?.getCurrentUserMobile() ?: ""
+            )
+            dao.insertTombstone(tomb)
+            queueSync("GUEST_LOGIN", syncKey, "DELETE", SyncSerializer.tombstoneToJson(tomb))
+        }
+        dao.clearGuestLogins()
+        syncEngine?.triggerAutomaticSync()
+    }
+
+    val appUpdateState: StateFlow<AppUpdateState> = syncEngine?.appUpdateState ?: MutableStateFlow(AppUpdateState())
+
+    suspend fun checkAppUpdateManually(): AppUpdateState {
+        return syncEngine?.checkAppUpdateManually() ?: AppUpdateState()
+    }
+
+    suspend fun publishAppUpdate(versionName: String, versionCode: Int, releaseNotes: String, updateUrl: String): Boolean {
+        return syncEngine?.publishAppUpdate(versionName, versionCode, releaseNotes, updateUrl) ?: false
+    }
+
+    // Purchase Invoices for Purchase GST
+    fun getAllPurchaseInvoices(): Flow<List<PurchaseInvoiceEntity>> = dao.getAllPurchaseInvoices()
+
+    suspend fun insertPurchaseInvoice(purchase: PurchaseInvoiceEntity): Long {
+        val id = dao.insertPurchaseInvoice(purchase)
+        syncEngine?.triggerAutomaticSync()
+        return id
+    }
+
+    suspend fun updatePurchaseInvoice(purchase: PurchaseInvoiceEntity) {
+        dao.updatePurchaseInvoice(purchase)
+        syncEngine?.triggerAutomaticSync()
+    }
+
+    suspend fun deletePurchaseInvoice(id: Long) {
+        dao.deletePurchaseInvoice(id)
+        syncEngine?.triggerAutomaticSync()
+    }
 }

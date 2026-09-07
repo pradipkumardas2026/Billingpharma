@@ -15,6 +15,7 @@ import com.example.data.local.entity.InvoiceItemEntity
 import com.example.data.local.entity.MedicineEntity
 import com.example.data.local.entity.PartyEntity
 import com.example.data.local.entity.PatientEntity
+import com.example.data.local.entity.PurchaseInvoiceEntity
 import com.example.data.local.entity.SettingsEntity
 import com.example.data.local.entity.StockTransactionEntity
 import com.example.data.local.entity.SyncOperationEntity
@@ -36,9 +37,10 @@ import kotlinx.coroutines.launch
         AdminUserEntity::class,
         GuestLoginEntity::class,
         SyncOperationEntity::class,
-        TombstoneEntity::class
+        TombstoneEntity::class,
+        PurchaseInvoiceEntity::class
     ],
-    version = 7,
+    version = 8,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -122,6 +124,32 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS purchase_invoices (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        invoiceNumber TEXT NOT NULL,
+                        date INTEGER NOT NULL,
+                        dateFormatted TEXT NOT NULL,
+                        companyName TEXT NOT NULL,
+                        companyGst TEXT NOT NULL,
+                        companyPhone TEXT NOT NULL,
+                        itemsSummary TEXT NOT NULL,
+                        totalQty INTEGER NOT NULL,
+                        taxableAmount REAL NOT NULL,
+                        gstRatePercent REAL NOT NULL,
+                        cgstAmount REAL NOT NULL,
+                        sgstAmount REAL NOT NULL,
+                        totalGstAmount REAL NOT NULL,
+                        totalAmount REAL NOT NULL,
+                        note TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                """.trimIndent())
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -129,7 +157,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "pharmabill_db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
                     .fallbackToDestructiveMigration()
                     .addCallback(DatabaseCallback())
                     .build()
@@ -262,6 +290,67 @@ abstract class AppDatabase : RoomDatabase() {
                         phoneNumber = "9876541230",
                         doctorName = "Dr. S. K. Mukherjee",
                         address = "Nilpur, Burdwan"
+                    )
+                )
+
+                // Starter Purchase Invoices for GST
+                dao.insertPurchaseInvoice(
+                    PurchaseInvoiceEntity(
+                        invoiceNumber = "PUR-2024-001",
+                        date = System.currentTimeMillis() - 86400000L * 3,
+                        dateFormatted = "04/09/2026",
+                        companyName = "MICRO LABS LTD",
+                        companyGst = "19AABCM5432K1Z8",
+                        companyPhone = "9800112233",
+                        itemsSummary = "PARACETAMOL 650MG (200 Strips)",
+                        totalQty = 200,
+                        taxableAmount = 3600.0,
+                        gstRatePercent = 12.0,
+                        cgstAmount = 216.0,
+                        sgstAmount = 216.0,
+                        totalGstAmount = 432.0,
+                        totalAmount = 4032.0,
+                        note = "Stock Purchase Dolo 650"
+                    )
+                )
+
+                dao.insertPurchaseInvoice(
+                    PurchaseInvoiceEntity(
+                        invoiceNumber = "PUR-2024-002",
+                        date = System.currentTimeMillis() - 86400000L * 2,
+                        dateFormatted = "05/09/2026",
+                        companyName = "CIPLA PHARMACEUTICALS",
+                        companyGst = "19AABCC1122J1Z4",
+                        companyPhone = "9833445566",
+                        itemsSummary = "AZITHROMYCIN 500MG (50 Strips)",
+                        totalQty = 50,
+                        taxableAmount = 3600.0,
+                        gstRatePercent = 12.0,
+                        cgstAmount = 216.0,
+                        sgstAmount = 216.0,
+                        totalGstAmount = 432.0,
+                        totalAmount = 4032.0,
+                        note = "Stock Purchase Aziwin 500"
+                    )
+                )
+
+                dao.insertPurchaseInvoice(
+                    PurchaseInvoiceEntity(
+                        invoiceNumber = "PUR-2024-003",
+                        date = System.currentTimeMillis() - 86400000L,
+                        dateFormatted = "06/09/2026",
+                        companyName = "ALKEM LABORATORIES",
+                        companyGst = "19AABCA9988H1Z1",
+                        companyPhone = "9877889900",
+                        itemsSummary = "PANTOPRAZOLE 40MG (120 Caps)",
+                        totalQty = 120,
+                        taxableAmount = 6600.0,
+                        gstRatePercent = 12.0,
+                        cgstAmount = 396.0,
+                        sgstAmount = 396.0,
+                        totalGstAmount = 792.0,
+                        totalAmount = 7392.0,
+                        note = "Stock Purchase Pan 40"
                     )
                 )
             }

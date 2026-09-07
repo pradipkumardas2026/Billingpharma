@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.local.entity.DoctorEntity
 import com.example.data.local.entity.InvoiceEntity
+import com.example.data.local.entity.InvoiceItemEntity
 import com.example.data.local.entity.MedicineEntity
 import com.example.data.local.entity.PartyEntity
 import com.example.data.local.entity.PatientEntity
@@ -87,6 +88,7 @@ fun NewBillScreen(
     var itemToEdit by remember { mutableStateOf<Pair<Int, BillDraftItem>?>(null) }
     var medicineToAdd by remember { mutableStateOf<MedicineEntity?>(null) }
     var generatedInvoice by remember { mutableStateOf<InvoiceEntity?>(null) }
+    var generatedInvoiceItems by remember { mutableStateOf<List<InvoiceItemEntity>>(emptyList()) }
 
     val customerTypes = listOf("PARTY", "DOCTOR", "PATIENT")
 
@@ -947,8 +949,9 @@ fun NewBillScreen(
                             Toast.makeText(context, "Please add at least one item to bill", Toast.LENGTH_SHORT).show()
                             return@Button
                         }
-                        viewModel.saveOrFinalizeCurrentBill { savedInv ->
+                        viewModel.saveOrFinalizeCurrentBillWithItems { savedInv, savedItems ->
                             generatedInvoice = savedInv
+                            generatedInvoiceItems = savedItems
                         }
                     },
                     modifier = Modifier
@@ -1539,9 +1542,14 @@ fun NewBillScreen(
 
     // Bill Generated Success Dialog
     generatedInvoice?.let { inv ->
+        val specificItemsFlow by viewModel.getItemsForInvoiceFlow(inv.invoiceNumber).collectAsState(initial = emptyList())
         val allInvoiceItems by viewModel.invoiceItems.collectAsState()
-        val invItems = remember(allInvoiceItems, inv) {
-            allInvoiceItems.filter { it.invoiceNumber == inv.invoiceNumber }
+        val invItems = remember(generatedInvoiceItems, specificItemsFlow, allInvoiceItems, inv) {
+            when {
+                generatedInvoiceItems.isNotEmpty() -> generatedInvoiceItems
+                specificItemsFlow.isNotEmpty() -> specificItemsFlow
+                else -> allInvoiceItems.filter { it.invoiceNumber == inv.invoiceNumber }
+            }
         }
 
         AlertDialog(

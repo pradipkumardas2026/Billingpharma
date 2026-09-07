@@ -37,6 +37,15 @@ data class SyncInfo(
     val projectId: String = "pharma-billing-cloud"
 )
 
+data class AppUpdateState(
+    val hasUpdate: Boolean = false,
+    val latestVersionName: String = "1.0",
+    val latestVersionCode: Int = 1,
+    val releaseNotes: String = "",
+    val updateUrl: String = "",
+    val publishedAt: Long = 0L
+)
+
 class FirebaseSyncEngine(
     private val context: Context,
     private val dao: PharmaDao,
@@ -46,6 +55,9 @@ class FirebaseSyncEngine(
 
     private val _syncInfo = MutableStateFlow(loadInitialSyncInfo())
     val syncInfo: StateFlow<SyncInfo> = _syncInfo.asStateFlow()
+
+    private val _appUpdateState = MutableStateFlow(AppUpdateState())
+    val appUpdateState: StateFlow<AppUpdateState> = _appUpdateState.asStateFlow()
 
     private val syncScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val syncMutex = Mutex()
@@ -73,6 +85,7 @@ class FirebaseSyncEngine(
         "pharma_doctors",
         "pharma_patients",
         "pharma_invoices",
+        "pharma_purchase_invoices",
         "pharma_settings",
         "pharma_admin_users",
         "pharma_guest_logins",
@@ -232,10 +245,96 @@ class FirebaseSyncEngine(
                 Log.e("FirebaseSyncEngine", "Failed to register listener for $collName: ${e.message}")
             }
         }
+
+        try {
+            val updateReg = firestore.collection("pharma_app_meta").document("update_info")
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null || snapshot == null || !snapshot.exists()) return@addSnapshotListener
+                    val verCode = snapshot.getLong("versionCode")?.toInt() ?: 1
+                    val verName = snapshot.getString("versionName") ?: "1.0"
+                    val notes = snapshot.getString("releaseNotes") ?: ""
+                    val url = snapshot.getString("updateUrl") ?: ""
+                    val pubAt = snapshot.getLong("publishedAt") ?: 0L
+                    val isAvail = snapshot.getBoolean("updateAvailable") ?: (verCode > 1)
+                    val forcePrompt = snapshot.getBoolean("forcePrompt") ?: false
+                    _appUpdateState.value = AppUpdateState(
+                        hasUpdate = isAvail && (verCode > 1 || forcePrompt),
+                        latestVersionName = verName,
+                        latestVersionCode = verCode,
+                        releaseNotes = notes,
+                        updateUrl = url,
+                        publishedAt = pubAt
+                    )
+                }
+            listenerRegistrations.add(updateReg)
+        } catch (e: Exception) {
+            Log.w("FirebaseSyncEngine", "Failed to listen for app update: ${e.message}")
+        }
     }
 
+    suspend fun checkAppUpdateManually(): AppUpdateState = withContext(Dispatchers.IO) {
+        try {
+            val task = firestore.collection("pharma_app_meta").document("update_info").get()
+            val snapshot = Tasks.await(task, 8, TimeUnit.SECONDS)
+            if (snapshot != null && snapshot.exists()) {
+                val verCode = snapshot.getLong("versionCode")?.toInt() ?: 1
+                val verName = snapshot.getString("versionName") ?: "1.0"
+                val notes = snapshot.getString("releaseNotes") ?: ""
+                val url = snapshot.getString("updateUrl") ?: ""
+                val pubAt = snapshot.getLong("publishedAt") ?: 0L
+                val isAvail = snapshot.getBoolean("updateAvailable") ?: (verCode > 1)
+                val forcePrompt = snapshot.getBoolean("forcePrompt") ?: false
+                val state = AppUpdateState(
+                    hasUpdate = isAvail && (verCode > 1 || forcePrompt),
+                    latestVersionName = verName,
+                    latestVersionCode = verCode,
+                    releaseNotes = notes,
+                    updateUrl = url,
+                    publishedAt = pubAt
+                )
+                _appUpdateState.value = state
+                return@withContext state
+            }
+        } catch (e: Exception) {
+            Log.w("FirebaseSyncEngine", "Manual update check error: ${e.message}")
+        }
+        return@withContext _appUpdateState.value
+    }
+
+    suspend fun publishAppUpdate(versionName: String, versionCode: Int, releaseNotes: String, updateUrl: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val data = hashMapOf(
+                "versionName" to versionName,
+                "versionCode" to versionCode,
+                "releaseNotes" to releaseNotes,
+                "updateUrl" to updateUrl,
+                "updateAvailable" to true,
+                "forcePrompt" to true,
+                "publishedAt" to System.currentTimeMillis()
+            )
+            val task = firestore.collection("pharma_app_meta").document("update_info").set(data, SetOptions.merge())
+            Tasks.await(task, 10, TimeUnit.SECONDS)
+            _appUpdateState.value = AppUpdateState(
+                hasUpdate = true,
+                latestVersionName = versionName,
+                latestVersionCode = versionCode,
+                releaseNotes = releaseNotes,
+                updateUrl = updateUrl,
+                publishedAt = System.currentTimeMillis()
+            )
+            return@withContext true
+        } catch (e: Exception) {
+            Log.e("FirebaseSyncEngine", "Failed to publish app update: ${e.message}", e)
+            return@withContext false
+        }
+    }
+
+    private var autoSyncJob: Job? = null
+
     fun triggerAutomaticSync() {
-        syncScope.launch {
+        autoSyncJob?.cancel()
+        autoSyncJob = syncScope.launch {
+            delay(500) // Debounce rapid keystrokes/transactions to keep app blazing fast
             if (!networkMonitor.isOnline.value) {
                 val pending = dao.getPendingSyncOperations().size
                 _syncInfo.value = _syncInfo.value.copy(
@@ -245,11 +344,11 @@ class FirebaseSyncEngine(
                 )
                 return@launch
             }
-            performFullSync()
+            performFullSync(pullFromRemote = false)
         }
     }
 
-    suspend fun performFullSync() {
+    suspend fun performFullSync(pullFromRemote: Boolean = true) {
         if (!syncMutex.tryLock()) return
 
         try {
@@ -274,8 +373,12 @@ class FirebaseSyncEngine(
                 }
             }
 
-            // Step 2: Download remote changes from Firestore collections
-            pullRemoteChanges()
+            // Step 2: Download remote changes from Firestore collections (parallel & throttled)
+            if (pullFromRemote) {
+                pullRemoteChanges(force = true)
+            } else {
+                pullRemoteChanges(force = false)
+            }
 
             val remainingPending = dao.getPendingSyncOperations().size
             val now = System.currentTimeMillis()
@@ -380,13 +483,21 @@ class FirebaseSyncEngine(
         }
     }
 
-    private suspend fun pullRemoteChanges() = withContext(Dispatchers.IO) {
+    private var lastPullTime = 0L
+
+    private suspend fun pullRemoteChanges(force: Boolean = false) = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        // If listeners are already actively receiving real-time Firestore pushes, avoid heavy sequential full pulls
+        if (!force && (now - lastPullTime) < 300_000L) {
+            return@withContext
+        }
+        lastPullTime = now
         val currentDeviceId = getDeviceId()
 
         // 1. Pull tombstones first to ensure any deleted records are immediately removed
         try {
             val tombTask = firestore.collection("pharma_tombstones").get()
-            val tombSnapshot = Tasks.await(tombTask, 10, TimeUnit.SECONDS)
+            val tombSnapshot = Tasks.await(tombTask, 4, TimeUnit.SECONDS)
             for (doc in tombSnapshot.documents) {
                 val entityType = doc.getString("entityType") ?: continue
                 val entityId = doc.getString("entityId") ?: continue
@@ -405,46 +516,50 @@ class FirebaseSyncEngine(
                 applyDeletionToRoom(entityType, entityId)
             }
         } catch (e: Exception) {
-            Log.w("FirebaseSyncEngine", "Error pulling tombstones from Firestore: ${e.message}")
+            Log.w("FirebaseSyncEngine", "Note: tombstones check: ${e.message}")
         }
 
-        // 2. Pull all regular business collections
-        for (collName in collectionsToSync) {
-            if (collName == "pharma_tombstones") continue
-            try {
-                val queryTask = firestore.collection(collName).get()
-                val snapshot = Tasks.await(queryTask, 10, TimeUnit.SECONDS)
-                for (doc in snapshot.documents) {
-                    val docDeviceId = doc.getString("deviceId") ?: ""
-                    if (docDeviceId != currentDeviceId && docDeviceId.isNotEmpty()) {
-                        val entityType = doc.getString("entityType") ?: getEntityTypeFromCollection(collName)
-                        val entityId = doc.getString("entityId") ?: doc.id
-                        val payloadJson = doc.getString("payloadJson") ?: ""
-                        val isDeleted = doc.getBoolean("isDeleted") ?: false
-                        val remoteTimestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
+        // 2. Parallel pull of regular business collections using coroutines (drastically faster)
+        coroutineScope {
+            val nonTombstoneCollections = collectionsToSync.filter { it != "pharma_tombstones" }
+            nonTombstoneCollections.map { collName ->
+                async(Dispatchers.IO) {
+                    try {
+                        val queryTask = firestore.collection(collName).get()
+                        val snapshot = Tasks.await(queryTask, 4, TimeUnit.SECONDS)
+                        for (doc in snapshot.documents) {
+                            val docDeviceId = doc.getString("deviceId") ?: ""
+                            if (docDeviceId != currentDeviceId && docDeviceId.isNotEmpty()) {
+                                val entityType = doc.getString("entityType") ?: getEntityTypeFromCollection(collName)
+                                val entityId = doc.getString("entityId") ?: doc.id
+                                val payloadJson = doc.getString("payloadJson") ?: ""
+                                val isDeleted = doc.getBoolean("isDeleted") ?: false
+                                val remoteTimestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
 
-                        if (isDeleted) {
-                            val tomb = TombstoneEntity(
-                                entityType = entityType,
-                                entityId = entityId,
-                                deletedAt = remoteTimestamp,
-                                deviceId = docDeviceId,
-                                userMobile = doc.getString("userMobile") ?: ""
-                            )
-                            dao.insertTombstone(tomb)
-                            applyDeletionToRoom(entityType, entityId)
-                        } else if (payloadJson.isNotBlank()) {
-                            if (dao.isTombstoned(entityType, entityId) > 0) {
-                                applyDeletionToRoom(entityType, entityId)
-                            } else {
-                                applyRemoteChange(entityType, payloadJson, false, remoteTimestamp)
+                                if (isDeleted) {
+                                    val tomb = TombstoneEntity(
+                                        entityType = entityType,
+                                        entityId = entityId,
+                                        deletedAt = remoteTimestamp,
+                                        deviceId = docDeviceId,
+                                        userMobile = doc.getString("userMobile") ?: ""
+                                    )
+                                    dao.insertTombstone(tomb)
+                                    applyDeletionToRoom(entityType, entityId)
+                                } else if (payloadJson.isNotBlank()) {
+                                    if (dao.isTombstoned(entityType, entityId) > 0) {
+                                        applyDeletionToRoom(entityType, entityId)
+                                    } else {
+                                        applyRemoteChange(entityType, payloadJson, false, remoteTimestamp)
+                                    }
+                                }
                             }
                         }
+                    } catch (e: Exception) {
+                        Log.w("FirebaseSyncEngine", "Non-fatal pull note for $collName: ${e.message}")
                     }
                 }
-            } catch (e: Exception) {
-                Log.w("FirebaseSyncEngine", "Error pulling $collName from Firestore: ${e.message}")
-            }
+            }.awaitAll()
         }
     }
 
@@ -753,6 +868,36 @@ class FirebaseSyncEngine(
                         }
                     }
                 }
+                "PURCHASE_INVOICE" -> {
+                    val id = json.optLong("id", 0L)
+                    val invNo = json.optString("invoiceNumber", "")
+                    if (isDeleted) {
+                        if (id > 0) dao.deletePurchaseInvoiceById(id)
+                        else if (invNo.isNotBlank()) dao.deletePurchaseInvoiceByNumber(invNo)
+                    } else if (invNo.isNotBlank()) {
+                        val existing = dao.getPurchaseInvoiceByNumber(invNo)
+                        val purchase = PurchaseInvoiceEntity(
+                            id = existing?.id ?: if (id > 0) id else 0L,
+                            invoiceNumber = invNo,
+                            date = json.optLong("date", remoteTimestamp),
+                            dateFormatted = json.optString("dateFormatted", ""),
+                            companyName = json.optString("companyName", ""),
+                            companyGst = json.optString("companyGst", ""),
+                            companyPhone = json.optString("companyPhone", ""),
+                            itemsSummary = json.optString("itemsSummary", ""),
+                            totalQty = json.optInt("totalQty", 1),
+                            taxableAmount = json.optDouble("taxableAmount", 0.0),
+                            gstRatePercent = json.optDouble("gstRatePercent", 12.0),
+                            cgstAmount = json.optDouble("cgstAmount", 0.0),
+                            sgstAmount = json.optDouble("sgstAmount", 0.0),
+                            totalGstAmount = json.optDouble("totalGstAmount", 0.0),
+                            totalAmount = json.optDouble("totalAmount", 0.0),
+                            note = json.optString("note", ""),
+                            createdAt = json.optLong("createdAt", remoteTimestamp)
+                        )
+                        dao.insertPurchaseInvoice(purchase)
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.e("FirebaseSyncEngine", "Error applying remote change for $entityType", e)
@@ -785,6 +930,11 @@ class FirebaseSyncEngine(
                         dao.deleteInvoice(inv)
                     }
                 }
+                "PURCHASE_INVOICE" -> {
+                    val id = entityId.toLongOrNull() ?: 0L
+                    if (id > 0) dao.deletePurchaseInvoiceById(id)
+                    else dao.deletePurchaseInvoiceByNumber(entityId)
+                }
                 "ADMIN_USER" -> {
                     val id = entityId.toLongOrNull() ?: 0L
                     if (id > 0) dao.deleteAdminUser(id)
@@ -792,6 +942,15 @@ class FirebaseSyncEngine(
                 "GUEST_LOGIN" -> {
                     val id = entityId.toLongOrNull() ?: 0L
                     if (id > 0) dao.deleteGuestLogin(id)
+                    if (entityId.contains("_")) {
+                        val parts = entityId.split("_")
+                        val mobile = parts.getOrNull(0) ?: ""
+                        val timestamp = parts.getOrNull(1)?.toLongOrNull() ?: 0L
+                        if (mobile.isNotBlank() && timestamp > 0) {
+                            val existing = dao.findGuestLogin(mobile, timestamp)
+                            if (existing != null) dao.deleteGuestLogin(existing.id)
+                        }
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -803,6 +962,7 @@ class FirebaseSyncEngine(
         return when (entityType.uppercase()) {
             "MEDICINE" -> "pharma_medicines"
             "INVOICE" -> "pharma_invoices"
+            "PURCHASE_INVOICE" -> "pharma_purchase_invoices"
             "PARTY" -> "pharma_parties"
             "DOCTOR" -> "pharma_doctors"
             "PATIENT" -> "pharma_patients"
@@ -819,6 +979,7 @@ class FirebaseSyncEngine(
         return when (collectionName) {
             "pharma_medicines" -> "MEDICINE"
             "pharma_invoices" -> "INVOICE"
+            "pharma_purchase_invoices" -> "PURCHASE_INVOICE"
             "pharma_parties" -> "PARTY"
             "pharma_doctors" -> "DOCTOR"
             "pharma_patients" -> "PATIENT"

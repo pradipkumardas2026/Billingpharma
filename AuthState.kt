@@ -13,7 +13,8 @@ enum class NavigationTab {
     SALES,
     SALES_HISTORY,
     ALERTS,
-    SETTINGS
+    SETTINGS,
+    GST
 }
 
 data class AuthState(

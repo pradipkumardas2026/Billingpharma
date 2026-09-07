@@ -13,6 +13,7 @@ import com.example.data.local.entity.InvoiceItemEntity
 import com.example.data.local.entity.MedicineEntity
 import com.example.data.local.entity.PartyEntity
 import com.example.data.local.entity.PatientEntity
+import com.example.data.local.entity.PurchaseInvoiceEntity
 import com.example.data.local.entity.SettingsEntity
 import com.example.data.local.entity.StockTransactionEntity
 import com.example.data.local.entity.SyncOperationEntity
@@ -234,6 +235,12 @@ interface PharmaDao {
     @Query("SELECT * FROM guest_logins WHERE mobileNumber = :mobile AND loginTimestamp = :timestamp LIMIT 1")
     suspend fun findGuestLogin(mobile: String, timestamp: Long): GuestLoginEntity?
 
+    @Query("SELECT * FROM guest_logins WHERE id = :id LIMIT 1")
+    suspend fun getGuestLoginById(id: Long): GuestLoginEntity?
+
+    @Query("SELECT * FROM guest_logins ORDER BY loginTimestamp DESC")
+    suspend fun getAllGuestLoginsList(): List<GuestLoginEntity>
+
     @Query("DELETE FROM guest_logins WHERE id = :id")
     suspend fun deleteGuestLogin(id: Long)
 
@@ -246,6 +253,9 @@ interface PharmaDao {
 
     @Update
     suspend fun updateSyncOperation(op: SyncOperationEntity)
+
+    @Query("SELECT * FROM sync_operations WHERE entityType = :entityType AND entityId = :entityId AND status IN ('PENDING', 'FAILED') LIMIT 1")
+    suspend fun getPendingOpForEntity(entityType: String, entityId: String): SyncOperationEntity?
 
     @Query("SELECT * FROM sync_operations WHERE status IN ('PENDING', 'FAILED') ORDER BY timestamp ASC")
     suspend fun getPendingSyncOperations(): List<SyncOperationEntity>
@@ -302,4 +312,29 @@ interface PharmaDao {
 
     @Query("DELETE FROM sync_tombstones WHERE entityType = :entityType AND entityId = :entityId")
     suspend fun deleteTombstone(entityType: String, entityId: String)
+
+    // Purchase Invoices & Purchase GST
+    @Query("SELECT * FROM purchase_invoices ORDER BY date DESC, id DESC")
+    fun getAllPurchaseInvoices(): Flow<List<PurchaseInvoiceEntity>>
+
+    @Query("SELECT * FROM purchase_invoices WHERE id = :id LIMIT 1")
+    suspend fun getPurchaseInvoiceById(id: Long): PurchaseInvoiceEntity?
+
+    @Query("SELECT * FROM purchase_invoices WHERE invoiceNumber = :invNo LIMIT 1")
+    suspend fun getPurchaseInvoiceByNumber(invNo: String): PurchaseInvoiceEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertPurchaseInvoice(purchase: PurchaseInvoiceEntity): Long
+
+    @Update
+    suspend fun updatePurchaseInvoice(purchase: PurchaseInvoiceEntity)
+
+    @Query("DELETE FROM purchase_invoices WHERE id = :id")
+    suspend fun deletePurchaseInvoice(id: Long)
+
+    @Query("DELETE FROM purchase_invoices WHERE id = :id")
+    suspend fun deletePurchaseInvoiceById(id: Long)
+
+    @Query("DELETE FROM purchase_invoices WHERE invoiceNumber = :invNo")
+    suspend fun deletePurchaseInvoiceByNumber(invNo: String)
 }

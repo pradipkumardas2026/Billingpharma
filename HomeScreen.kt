@@ -224,6 +224,59 @@ fun HomeScreen(
             }
         }
 
+        // Master Admin GST Register Quick Banner: "sub admin er kachhe option show korbe na"
+        if (authState.isMasterAdmin) {
+            Card(
+                onClick = { viewModel.switchTab(NavigationTab.GST) },
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFEBF5FB)),
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, SkyBlueBorder),
+                modifier = Modifier.fillMaxWidth().testTag("home_gst_card")
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Surface(
+                            color = SkyBluePrimary,
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.size(36.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(Icons.Default.ReceiptLong, contentDescription = null, tint = PureWhite, modifier = Modifier.size(20.dp))
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("GST Portal & Tax Register", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = SkyBlueText)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Surface(
+                                    color = AlertRed,
+                                    shape = RoundedCornerShape(3.dp)
+                                ) {
+                                    Text(
+                                        "MASTER ADMIN",
+                                        fontSize = 8.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = PureWhite,
+                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                    )
+                                }
+                            }
+                            Text("Selling GST & Purchase GST (PDF Register Print)", fontSize = 11.sp, color = Color.DarkGray)
+                        }
+                    }
+                    Icon(Icons.Default.ChevronRight, contentDescription = null, tint = SkyBluePrimary)
+                }
+            }
+        }
+
         // Search Bar for Recent Invoices
         OutlinedTextField(
             value = searchQuery,

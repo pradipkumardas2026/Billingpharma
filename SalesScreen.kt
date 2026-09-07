@@ -15,6 +15,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -33,7 +34,8 @@ fun SalesScreen(
     viewModel: PharmaViewModel,
     onNewBill: () -> Unit,
     onViewInvoice: (InvoiceEntity) -> Unit,
-    onEditInvoice: (InvoiceEntity) -> Unit
+    onEditInvoice: (InvoiceEntity) -> Unit,
+    onOpenKhata: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val authState by viewModel.authState.collectAsState()
@@ -48,6 +50,8 @@ fun SalesScreen(
     var paymentAmountStr by remember { mutableStateOf("") }
     var invoiceToDelete by remember { mutableStateOf<InvoiceEntity?>(null) }
     var showAdminOnlyDialog by remember { mutableStateOf(false) }
+    var showGstAdminOnlyDialog by remember { mutableStateOf(false) }
+    var showLocalKhataDialog by remember { mutableStateOf(false) }
 
     val totalSales = remember(invoices) { invoices.sumOf { it.netAmount } }
     val totalPaid = remember(invoices) { invoices.sumOf { it.paidAmount } }
@@ -81,31 +85,57 @@ fun SalesScreen(
             SummaryBox("Total Due", if (authState.isGuest) "₹••••••" else "₹${String.format("%.2f", totalDue)}", AlertRed, modifier = Modifier.weight(1f))
         }
 
-        // Quick Navigation
+        // Quick Navigation: Sales History -> Khata -> GST File
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Button(
                 onClick = { viewModel.switchTab(NavigationTab.SALES_HISTORY) },
                 modifier = Modifier.weight(1f),
                 colors = ButtonDefaults.buttonColors(containerColor = SkyBlueSecondary),
-                shape = RoundedCornerShape(8.dp)
+                shape = RoundedCornerShape(8.dp),
+                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
             ) {
-                Icon(Icons.Default.History, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("Sales History", fontSize = 12.sp)
+                Icon(Icons.Default.History, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(modifier = Modifier.width(3.dp))
+                Text("Sales History", fontSize = 11.sp, maxLines = 1)
             }
 
             Button(
-                onClick = { viewModel.navigateToSalesHistory() },
+                onClick = {
+                    if (onOpenKhata != null) {
+                        onOpenKhata()
+                    } else {
+                        showLocalKhataDialog = true
+                    }
+                },
                 modifier = Modifier.weight(1f),
                 colors = ButtonDefaults.buttonColors(containerColor = SkyBluePrimary),
-                shape = RoundedCornerShape(8.dp)
+                shape = RoundedCornerShape(8.dp),
+                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
             ) {
-                Icon(Icons.AutoMirrored.Filled.MenuBook, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("KHATA", fontSize = 12.sp)
+                Icon(Icons.AutoMirrored.Filled.MenuBook, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(modifier = Modifier.width(3.dp))
+                Text("KHATA", fontSize = 11.sp, maxLines = 1)
+            }
+
+            Button(
+                onClick = {
+                    if (authState.isMasterAdmin) {
+                        viewModel.switchTab(NavigationTab.GST)
+                    } else {
+                        showGstAdminOnlyDialog = true
+                    }
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F766E)), // Deep Teal for GST File
+                shape = RoundedCornerShape(8.dp),
+                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
+            ) {
+                Icon(Icons.Default.ReceiptLong, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(modifier = Modifier.width(3.dp))
+                Text("GST FILE", fontSize = 11.sp, maxLines = 1)
             }
         }
 
@@ -376,6 +406,32 @@ fun SalesScreen(
 
     if (showAdminOnlyDialog) {
         AdminOnlyDialog(onDismiss = { showAdminOnlyDialog = false })
+    }
+
+    if (showGstAdminOnlyDialog) {
+        AlertDialog(
+            onDismissRequest = { showGstAdminOnlyDialog = false },
+            icon = { Icon(Icons.Default.Lock, contentDescription = null, tint = AlertRed) },
+            title = { Text("Master Admin Access Only (শুধুমাত্র মাস্টার অ্যাডমিন)", fontWeight = FontWeight.Bold) },
+            text = {
+                Text("GST File and Tax Registers contain sensitive government tax filing documents and are strictly restricted to the Master Admin (9002625428). Sub-admin and guest accounts cannot access GST files.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = { showGstAdminOnlyDialog = false },
+                    colors = ButtonDefaults.buttonColors(containerColor = SkyBluePrimary)
+                ) {
+                    Text("OK")
+                }
+            }
+        )
+    }
+
+    if (showLocalKhataDialog) {
+        KhataScreen(
+            viewModel = viewModel,
+            onDismiss = { showLocalKhataDialog = false }
+        )
     }
 }
 

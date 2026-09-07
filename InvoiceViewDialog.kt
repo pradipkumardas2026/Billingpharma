@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.data.local.entity.InvoiceEntity
+import com.example.data.local.entity.InvoiceItemEntity
 import com.example.ui.theme.*
 import com.example.ui.viewmodel.PharmaViewModel
 import com.example.util.NumberToWords
@@ -41,9 +42,22 @@ fun InvoiceViewDialog(
     val authState by viewModel.authState.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val allInvoiceItems by viewModel.invoiceItems.collectAsState()
+    val specificItemsFlow by viewModel.getItemsForInvoiceFlow(invoice.invoiceNumber).collectAsState(initial = emptyList())
+    var directItemsFromDb by remember(invoice.invoiceNumber) { mutableStateOf<List<InvoiceItemEntity>>(emptyList()) }
 
-    val items = remember(allInvoiceItems, invoice) {
-        allInvoiceItems.filter { it.invoiceNumber == invoice.invoiceNumber }
+    LaunchedEffect(invoice.invoiceNumber) {
+        val loaded = viewModel.getItemsForInvoice(invoice.invoiceNumber)
+        if (loaded.isNotEmpty()) {
+            directItemsFromDb = loaded
+        }
+    }
+
+    val items = remember(specificItemsFlow, directItemsFromDb, allInvoiceItems, invoice) {
+        when {
+            specificItemsFlow.isNotEmpty() -> specificItemsFlow
+            directItemsFromDb.isNotEmpty() -> directItemsFromDb
+            else -> allInvoiceItems.filter { it.invoiceNumber == invoice.invoiceNumber }
+        }
     }
 
     var showDeleteConfirm by remember { mutableStateOf(false) }
@@ -174,27 +188,42 @@ fun InvoiceViewDialog(
 
                                     HorizontalDivider(thickness = 1.dp, color = SkyBlueBorder)
 
-                                    items.forEachIndexed { index, item ->
-                                        val rowBg = if (index % 2 == 0) PureWhite else OffWhite
-                                        Row(
+                                    if (items.isEmpty()) {
+                                        Box(
                                             modifier = Modifier
-                                                .background(rowBg)
-                                                .padding(horizontal = 6.dp, vertical = 4.dp),
-                                            verticalAlignment = Alignment.CenterVertically
+                                                .fillMaxWidth()
+                                                .padding(24.dp),
+                                            contentAlignment = Alignment.Center
                                         ) {
-                                            Text("${index + 1}", fontSize = 11.sp, modifier = Modifier.width(30.dp))
-                                            Text(item.productName, fontSize = 11.sp, modifier = Modifier.width(160.dp))
-                                            Text(item.pack, fontSize = 11.sp, modifier = Modifier.width(60.dp), textAlign = TextAlign.Center)
-                                            Text(item.batchNo, fontSize = 11.sp, modifier = Modifier.width(70.dp))
-                                            Text(item.expDate, fontSize = 11.sp, modifier = Modifier.width(60.dp))
-                                            Text("${item.qty}", fontSize = 11.sp, modifier = Modifier.width(40.dp), textAlign = TextAlign.End)
-                                            Text("${item.freeQty}", fontSize = 11.sp, modifier = Modifier.width(40.dp), textAlign = TextAlign.End)
-                                            Text(if (authState.isGuest) "••••••" else String.format("%.2f", item.mrp), fontSize = 11.sp, modifier = Modifier.width(60.dp), textAlign = TextAlign.End)
-                                            Text(if (authState.isGuest) "••••••" else String.format("%.2f", item.price), fontSize = 11.sp, modifier = Modifier.width(60.dp), textAlign = TextAlign.End)
-                                            Text("${item.discountPercent}%", fontSize = 11.sp, modifier = Modifier.width(50.dp), textAlign = TextAlign.End)
-                                            Text(if (authState.isGuest) "••••••" else String.format("%.2f", item.itemTotalAmount), fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(70.dp), textAlign = TextAlign.End)
+                                            Text(
+                                                "No products / items recorded for this bill",
+                                                fontSize = 12.sp,
+                                                color = MutedText
+                                            )
                                         }
-                                        HorizontalDivider(thickness = 0.5.dp, color = LightBorder)
+                                    } else {
+                                        items.forEachIndexed { index, item ->
+                                            val rowBg = if (index % 2 == 0) PureWhite else OffWhite
+                                            Row(
+                                                modifier = Modifier
+                                                    .background(rowBg)
+                                                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text("${index + 1}", fontSize = 11.sp, modifier = Modifier.width(30.dp))
+                                                Text(item.productName, fontSize = 11.sp, modifier = Modifier.width(160.dp))
+                                                Text(item.pack, fontSize = 11.sp, modifier = Modifier.width(60.dp), textAlign = TextAlign.Center)
+                                                Text(item.batchNo, fontSize = 11.sp, modifier = Modifier.width(70.dp))
+                                                Text(item.expDate, fontSize = 11.sp, modifier = Modifier.width(60.dp))
+                                                Text("${item.qty}", fontSize = 11.sp, modifier = Modifier.width(40.dp), textAlign = TextAlign.End)
+                                                Text("${item.freeQty}", fontSize = 11.sp, modifier = Modifier.width(40.dp), textAlign = TextAlign.End)
+                                                Text(if (authState.isGuest) "••••••" else String.format("%.2f", item.mrp), fontSize = 11.sp, modifier = Modifier.width(60.dp), textAlign = TextAlign.End)
+                                                Text(if (authState.isGuest) "••••••" else String.format("%.2f", item.price), fontSize = 11.sp, modifier = Modifier.width(60.dp), textAlign = TextAlign.End)
+                                                Text("${item.discountPercent}%", fontSize = 11.sp, modifier = Modifier.width(50.dp), textAlign = TextAlign.End)
+                                                Text(if (authState.isGuest) "••••••" else String.format("%.2f", item.itemTotalAmount), fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(70.dp), textAlign = TextAlign.End)
+                                            }
+                                            HorizontalDivider(thickness = 0.5.dp, color = LightBorder)
+                                        }
                                     }
                                 }
                             }
@@ -368,7 +397,7 @@ fun InvoiceViewDialog(
             onDismissRequest = { showDeleteConfirm = false },
             title = { Text("Delete Bill #${invoice.invoiceNumber}", fontWeight = FontWeight.Bold, color = AlertRed) },
             text = {
-                Text("This action will:\n1. Completely reverse all items back to stock and free stock.\n2. Permanently delete this invoice from the database.")
+                Text("This action will:\n• Reverse product quantities & free quantities back into inventory stock.\n• Reverse product sales entries in Stock Statement.\n• Remove this bill from Khata ledger & Sales History.\n• Permanently delete this bill from local & cloud databases.")
             },
             confirmButton = {
                 Button(
@@ -376,11 +405,11 @@ fun InvoiceViewDialog(
                         viewModel.deleteBill(invoice.invoiceNumber)
                         showDeleteConfirm = false
                         onDismiss()
-                        Toast.makeText(context, "Invoice #${invoice.invoiceNumber} deleted and stock reversed!", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Bill #${invoice.invoiceNumber} deleted. Stock reversed & Khata updated.", Toast.LENGTH_SHORT).show()
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = AlertRed)
                 ) {
-                    Text("Delete Now")
+                    Text("Delete Bill")
                 }
             },
             dismissButton = {

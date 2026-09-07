@@ -8,6 +8,7 @@ val SkyBlueTertiary = Color(0xFF0277BD)
 val SkyBlueContainer = Color(0xFFE1F5FE)
 val SkyBlueLight = Color(0xFFF0F9FF)
 val SkyBlueBorder = Color(0xFFB3E5FC)
+val SkyBlueText = Color(0xFF01579B)
 
 val AlertRed = Color(0xFFD32F2F)
 val AlertRedLight = Color(0xFFFFEBEE)
